@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "db:generate": "drizzle-kit generate",
-    "db:push": "drizzle-kit push"
+    "db:push": "drizzle-kit push",
+    "db:reset": "rm -f bello.db"
   },
   "dependencies": {
     "@elysiajs/cors": "^1.4.1",

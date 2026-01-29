@@ -14,10 +14,25 @@ export const sessions = sqliteTable("sessions", {
     expiresAt: integer("expires_at", { mode: "timestamp" }).notNull()
 });
 
+export const projects = sqliteTable("projects", {
+    id: text("id").primaryKey(),
+    title: text("title").notNull(),
+    description: text("description"),
+    ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+});
+
+export const projectMembers = sqliteTable("project_members", {
+    projectId: text("project_id").notNull().references(() => projects.id, { onDelete: 'cascade' }),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    role: text("role").notNull().default('member'), // 'admin' | 'member'
+});
+
 export const boards = sqliteTable("boards", {
     id: text("id").primaryKey(),
     title: text("title").notNull(),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    projectId: text("project_id").references(() => projects.id, { onDelete: 'set null' }),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
 });
 

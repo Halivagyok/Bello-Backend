@@ -4,8 +4,8 @@ import { swagger } from '@elysiajs/swagger';
 import { cors } from '@elysiajs/cors';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers } from './db/schema';
-import { eq, asc, and } from 'drizzle-orm';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers } from './db/schema';
+import { eq, asc, and, desc } from 'drizzle-orm';
 
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
@@ -128,6 +128,54 @@ const app = new Elysia()
         }
     })
 
+    // --- PROJECTS ---
+    .group('/projects', (app) => app
+        .get('/', async ({ user }) => {
+            // Get projects where user is owner or member
+            const memberProjects = await db.select({
+                projectId: projectMembers.projectId
+            }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
+
+            const projectIds = memberProjects.map(m => m.projectId);
+
+            const allProjects = await db.select().from(projects);
+            return allProjects.filter(p => p.ownerId === user!.id || projectIds.includes(p.id));
+        })
+
+        .post('/', async ({ body, user }) => {
+            const newProject = {
+                id: crypto.randomUUID(),
+                title: body.title,
+                description: body.description,
+                ownerId: user!.id,
+            };
+            await db.insert(projects).values(newProject);
+            // Add owner as admin member
+            await db.insert(projectMembers).values({ projectId: newProject.id, userId: user!.id, role: 'admin' });
+            return newProject;
+        }, {
+            body: t.Object({
+                title: t.String(),
+                description: t.Optional(t.String())
+            })
+        })
+
+        // Get Project Details (including BOARDS in that project)
+        .get('/:id', async ({ params, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            // Check Access
+            const isMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            if (project.ownerId !== user!.id && !isMember) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
+            return project;
+        })
+    )
+
     // --- BOARDS ---
     .group('/boards', (app) => app
         .get('/', async ({ user }) => {
@@ -138,14 +186,9 @@ const app = new Elysia()
 
             const boardIds = memberBoards.map(m => m.boardId);
 
-            // Also get owned boards (though owner should be added as member ideally, let's keep it robust)
-            const ownedBoards = await db.select().from(boards).where(eq(boards.ownerId, user!.id));
-
-            // If we enforce owner is also a member, we can just query boardMembers + join boards
-            // But let's simple query:
             const allBoards = await db.select().from(boards);
-            // Filter in JS for simplicity or use complex OR query
 
+            // Return all relevant boards. Frontend will group them.
             return allBoards.filter(b => b.ownerId === user!.id || boardIds.includes(b.id));
         })
 
@@ -153,6 +196,7 @@ const app = new Elysia()
             const newBoard = {
                 id: crypto.randomUUID(),
                 title: body.title,
+                projectId: body.projectId,
                 ownerId: user!.id,
             };
             await db.insert(boards).values(newBoard);
@@ -161,7 +205,10 @@ const app = new Elysia()
 
             return newBoard;
         }, {
-            body: t.Object({ title: t.String() })
+            body: t.Object({
+                title: t.String(),
+                projectId: t.Optional(t.String())
+            })
         })
 
         .get('/:id', async ({ params, user, set }) => {
