@@ -1,5 +1,6 @@
 // backend/src/index.ts
 import { Elysia, t } from 'elysia';
+// import { websocket } from '@elysiajs/websocket'; its deprecated, built-in now
 import { swagger } from '@elysiajs/swagger';
 import { cors } from '@elysiajs/cors';
 import { drizzle } from 'drizzle-orm/libsql';
@@ -12,13 +13,39 @@ const client = createClient({ url: 'file:bello.db' });
 const db = drizzle(client);
 
 // 2. Initialize App
+// 2. Initialize App
 const app = new Elysia()
     .use(cors({
         origin: 'http://localhost:5173', // Vite default port
         credentials: true,
         allowedHeaders: ['Content-Type', 'Cookie']
-    }))
+    }));
+
+const broadcastUpdate = (boardId: string) => {
+    app.server?.publish(`board-${boardId}`, JSON.stringify({ type: 'update' }));
+};
+
+app
     .use(swagger())
+    // --- WEBSOCKET ---
+    // .use(websocket()) // Built-in now
+    .ws('/ws', {
+        open(ws) {
+            console.log('WS Connected');
+        },
+        message(ws, message: any) {
+            if (message.type === 'subscribe' && message.boardId) {
+                ws.subscribe(`board-${message.boardId}`);
+                console.log(`Subscribed to board-${message.boardId}`);
+            }
+            if (message.type === 'unsubscribe' && message.boardId) {
+                ws.unsubscribe(`board-${message.boardId}`);
+            }
+        },
+        close(ws) {
+            console.log('WS Closed');
+        }
+    })
 
     // --- AUTHENTICATION ---
     .group('/auth', (app) => app
@@ -231,8 +258,19 @@ const app = new Elysia()
                 ? (await db.select().from(cards)).filter(c => listIds.includes(c.listId)).sort((a, b) => a.position - b.position)
                 : [];
 
+            const members = await db.select({
+                id: users.id,
+                name: users.name,
+                email: users.email,
+                role: boardMembers.role
+            })
+                .from(boardMembers)
+                .innerJoin(users, eq(users.id, boardMembers.userId))
+                .where(eq(boardMembers.boardId, params.id));
+
             return {
                 ...board,
+                members,
                 lists: allLists.map(list => ({
                     ...list,
                     cards: allCards.filter(card => card.listId === list.id)
@@ -318,6 +356,10 @@ const app = new Elysia()
                 position: body.position ?? Date.now()
             };
             await db.insert(cards).values(newCard);
+
+            // Broadcast
+            broadcastUpdate(list.boardId);
+
             return newCard;
         }, {
             body: t.Object({
@@ -352,6 +394,13 @@ const app = new Elysia()
                 .set(body)
                 .where(eq(cards.id, params.id))
                 .returning();
+
+            // Broadcast
+            broadcastUpdate(list.boardId);
+            if (body.listId && body.listId !== card.listId) {
+                // Potentially broadcast to old board if moving boards, but for now assum same board
+            }
+
             return updated;
         }, {
             body: t.Object({
