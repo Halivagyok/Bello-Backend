@@ -326,6 +326,7 @@ app
                 boardId: params.id
             };
             await db.insert(lists).values(newList);
+            broadcastUpdate(params.id);
             return newList;
         }, {
             body: t.Object({
@@ -422,6 +423,7 @@ app
             if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
 
             await db.delete(cards).where(eq(cards.id, params.id));
+            broadcastUpdate(list.boardId);
             return { success: true };
         })
     )
@@ -440,6 +442,7 @@ app
                 .set(body)
                 .where(eq(lists.id, params.id))
                 .returning();
+            broadcastUpdate(list.boardId);
             return updated;
         }, {
             body: t.Object({
@@ -457,6 +460,7 @@ app
             if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
 
             await db.delete(lists).where(eq(lists.id, params.id));
+            broadcastUpdate(list.boardId);
             return { success: true };
         })
     )
