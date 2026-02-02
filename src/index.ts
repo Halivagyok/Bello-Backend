@@ -25,6 +25,14 @@ const broadcastUpdate = (boardId: string) => {
     app.server?.publish(`board-${boardId}`, JSON.stringify({ type: 'update' }));
 };
 
+const broadcastProjectUpdate = (projectId: string) => {
+    app.server?.publish(`project-${projectId}`, JSON.stringify({ type: 'project-update' }));
+};
+
+const broadcastUserUpdate = (userId: string) => {
+    app.server?.publish(`user-${userId}`, JSON.stringify({ type: 'user-update' }));
+};
+
 app
     .use(swagger())
     // --- WEBSOCKET ---
@@ -38,8 +46,22 @@ app
                 ws.subscribe(`board-${message.boardId}`);
                 console.log(`Subscribed to board-${message.boardId}`);
             }
+            if (message.type === 'subscribe-project' && message.projectId) {
+                ws.subscribe(`project-${message.projectId}`);
+                console.log(`Subscribed to project-${message.projectId}`);
+            }
+            if (message.type === 'subscribe-user' && message.userId) {
+                ws.subscribe(`user-${message.userId}`);
+                console.log(`Subscribed to user-${message.userId}`);
+            }
             if (message.type === 'unsubscribe' && message.boardId) {
                 ws.unsubscribe(`board-${message.boardId}`);
+            }
+            if (message.type === 'unsubscribe-project' && message.projectId) {
+                ws.unsubscribe(`project-${message.projectId}`);
+            }
+            if (message.type === 'unsubscribe-user' && message.userId) {
+                ws.unsubscribe(`user-${message.userId}`);
             }
         },
         close(ws) {
@@ -245,6 +267,14 @@ app
                 role: 'member'
             });
 
+            // Broadcast to all boards in project
+            const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.id));
+            for (const board of projectBoards) {
+                broadcastUpdate(board.id);
+            }
+            broadcastProjectUpdate(params.id);
+            broadcastUserUpdate(targetUser.id);
+
             return { success: true };
         }, {
             body: t.Object({
@@ -264,6 +294,14 @@ app
 
             await db.delete(projectMembers)
                 .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, params.userId)));
+
+            // Find all boards in this project and broadcast update to potentially kick users out of open boards
+            const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.id));
+            for (const board of projectBoards) {
+                broadcastUpdate(board.id);
+            }
+            broadcastProjectUpdate(params.id);
+            broadcastUserUpdate(params.userId);
 
             return { success: true };
         })
@@ -373,6 +411,9 @@ app
                 role: 'member'
             });
 
+            broadcastUpdate(params.id);
+            broadcastUserUpdate(targetUser.id);
+
             return { success: true };
 
         }, {
@@ -413,6 +454,9 @@ app
 
             await db.delete(boardMembers)
                 .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId)));
+
+            broadcastUpdate(params.id);
+            broadcastUserUpdate(params.userId);
 
             return { success: true };
         })
@@ -627,12 +671,21 @@ app
         .delete('/users/:id/projects/:projectId', async ({ params }) => {
             await db.delete(projectMembers)
                 .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId)));
+
+            // Find all boards in this project and broadcast update
+            const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.projectId));
+            for (const board of projectBoards) {
+                broadcastUpdate(board.id);
+            }
+            broadcastUserUpdate(params.id);
             return { success: true };
         })
 
         .delete('/users/:id/boards/:boardId', async ({ params }) => {
             await db.delete(boardMembers)
                 .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId)));
+            broadcastUpdate(params.boardId);
+            broadcastUserUpdate(params.id);
             return { success: true };
         })
     )
