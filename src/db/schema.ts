@@ -5,6 +5,8 @@ export const users = sqliteTable("users", {
     email: text("email").unique().notNull(),
     password: text("password").notNull(),
     name: text("name"),
+    isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
+    isBanned: integer("is_banned", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
 });
 

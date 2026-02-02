@@ -75,7 +75,7 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name } };
+            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: false } };
         }, {
             body: t.Object({
                 email: t.String(),
@@ -89,6 +89,11 @@ app
             if (!user) {
                 set.status = 400;
                 return { error: 'Invalid credentials' };
+            }
+
+            if (user.isBanned) {
+                set.status = 403;
+                return { error: 'Your account has been banned.' };
             }
 
             const valid = await Bun.password.verify(body.password, user.password);
@@ -106,7 +111,7 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name } };
+            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         }, {
             body: t.Object({
                 email: t.String(),
@@ -133,7 +138,7 @@ app
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
             if (!user) return { user: null };
 
-            return { user: { id: user.id, email: user.email, name: user.name } };
+            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         })
     )
 
@@ -199,7 +204,68 @@ app
             if (project.ownerId !== user!.id && !isMember) {
                 set.status = 403; return { error: 'Forbidden' };
             }
-            return project;
+            const members = await db.select({
+                id: users.id,
+                name: users.name,
+                email: users.email,
+                role: projectMembers.role,
+                isAdmin: users.isAdmin
+            })
+                .from(projectMembers)
+                .innerJoin(users, eq(users.id, projectMembers.userId))
+                .where(eq(projectMembers.projectId, params.id));
+
+            return { ...project, members };
+        })
+
+        .post('/:id/invite', async ({ params, body, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            // Check Access (Owner or Member) - simplified, generally members can invite
+            const isMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            if (project.ownerId !== user!.id && !isMember) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
+
+            const targetUser = await db.select().from(users).where(eq(users.email, body.email)).get();
+            if (!targetUser) { set.status = 404; return { error: 'User not found' }; }
+
+            // Check if already member
+            const existing = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, targetUser.id))).get();
+
+            if (existing) return { message: 'Already a member' };
+
+            await db.insert(projectMembers).values({
+                projectId: params.id,
+                userId: targetUser.id,
+                role: 'member'
+            });
+
+            return { success: true };
+        }, {
+            body: t.Object({
+                email: t.String()
+            })
+        })
+
+        .delete('/:id/members/:userId', async ({ params, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            // Allow if Project Owner OR System Admin
+            if (project.ownerId !== user!.id && !user!.isAdmin) {
+                set.status = 403;
+                return { error: 'Forbidden' };
+            }
+
+            await db.delete(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, params.userId)));
+
+            return { success: true };
         })
     )
 
@@ -262,7 +328,8 @@ app
                 id: users.id,
                 name: users.name,
                 email: users.email,
-                role: boardMembers.role
+                role: boardMembers.role,
+                isAdmin: users.isAdmin
             })
                 .from(boardMembers)
                 .innerJoin(users, eq(users.id, boardMembers.userId))
@@ -327,12 +394,27 @@ app
             };
             await db.insert(lists).values(newList);
             broadcastUpdate(params.id);
-            return newList;
         }, {
             body: t.Object({
                 title: t.String(),
                 position: t.Optional(t.Number())
             })
+        })
+
+        .delete('/:id/members/:userId', async ({ params, user, set }) => {
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
+
+            // Allow if Board Owner OR System Admin
+            if (board.ownerId !== user!.id && !user!.isAdmin) {
+                set.status = 403;
+                return { error: 'Forbidden' };
+            }
+
+            await db.delete(boardMembers)
+                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId)));
+
+            return { success: true };
         })
     )
 
@@ -461,6 +543,96 @@ app
 
             await db.delete(lists).where(eq(lists.id, params.id));
             broadcastUpdate(list.boardId);
+            return { success: true };
+        })
+    )
+
+    // --- ADMIN ---
+    .group('/admin', (app) => app
+        .onBeforeHandle(({ user, set }) => {
+            if (!user?.isAdmin) {
+                set.status = 403;
+                return { error: 'Admin access required' };
+            }
+        })
+
+        .get('/users', async ({ set }) => {
+            try {
+                const allUsers = await db.select().from(users);
+                const allProjectMembers = await db.select().from(projectMembers);
+                const allBoardMembers = await db.select().from(boardMembers);
+
+                const usersWithStats = allUsers.map(u => ({
+                    id: u.id,
+                    name: u.name,
+                    email: u.email,
+                    isAdmin: u.isAdmin,
+                    isBanned: u.isBanned,
+                    createdAt: u.createdAt,
+                    projectsCount: allProjectMembers.filter(pm => pm.userId === u.id).length,
+                    boardsCount: allBoardMembers.filter(bm => bm.userId === u.id).length
+                }));
+
+                return usersWithStats;
+            } catch (e) {
+                console.error(e);
+                set.status = 500;
+                return { error: 'Internal Server Error' };
+            }
+        })
+
+        .get('/users/:id/access', async ({ params, set }) => {
+            const memberProjects = await db.select({
+                projectId: projectMembers.projectId,
+                title: projects.title
+            })
+                .from(projectMembers)
+                .innerJoin(projects, eq(projects.id, projectMembers.projectId))
+                .where(eq(projectMembers.userId, params.id));
+
+            const memberBoards = await db.select({
+                boardId: boardMembers.boardId,
+                title: boards.title
+            })
+                .from(boardMembers)
+                .innerJoin(boards, eq(boards.id, boardMembers.boardId))
+                .where(eq(boardMembers.userId, params.id));
+
+            return { projects: memberProjects, boards: memberBoards };
+        })
+
+        .post('/users/:id/ban', async ({ params, set }) => {
+            const user = await db.select().from(users).where(eq(users.id, params.id)).get();
+            if (!user) { set.status = 404; return { error: 'User not found' }; }
+
+            // Toggle ban
+            await db.update(users)
+                .set({ isBanned: !user.isBanned })
+                .where(eq(users.id, params.id));
+
+            return { success: true, isBanned: !user.isBanned };
+        })
+
+        .patch('/users/:id/name', async ({ params, body, set }) => {
+            await db.update(users)
+                .set({ name: body.name })
+                .where(eq(users.id, params.id));
+            return { success: true };
+        }, {
+            body: t.Object({ name: t.String() })
+        })
+
+        // Force Remove Access (Admin) - though specialized endpoints exist, these might be useful shortcuts or bulk
+        // But plan said to add them:
+        .delete('/users/:id/projects/:projectId', async ({ params }) => {
+            await db.delete(projectMembers)
+                .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId)));
+            return { success: true };
+        })
+
+        .delete('/users/:id/boards/:boardId', async ({ params }) => {
+            await db.delete(boardMembers)
+                .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId)));
             return { success: true };
         })
     )
