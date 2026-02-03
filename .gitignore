@@ -11,6 +11,7 @@ coverage
 *.lcov
 
 bello.db
+drizzle
 
 # logs
 logs
