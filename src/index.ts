@@ -6,7 +6,7 @@ import { cors } from '@elysiajs/cors';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
 import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers } from './db/schema';
-import { eq, asc, and, desc } from 'drizzle-orm';
+import { eq, asc, and, desc, sql } from 'drizzle-orm';
 
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
@@ -159,6 +159,7 @@ app
 
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
             if (!user) return { user: null };
+            if (user.isBanned) return { user: null };
 
             return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         })
@@ -290,6 +291,12 @@ app
             if (project.ownerId !== user!.id && !user!.isAdmin) {
                 set.status = 403;
                 return { error: 'Forbidden' };
+            }
+
+            // Prevent removing the owner
+            if (project.ownerId === params.userId) {
+                set.status = 400;
+                return { error: 'Cannot remove project owner' };
             }
 
             await db.delete(projectMembers)
@@ -435,6 +442,7 @@ app
             };
             await db.insert(lists).values(newList);
             broadcastUpdate(params.id);
+            return newList;
         }, {
             body: t.Object({
                 title: t.String(),
@@ -450,6 +458,12 @@ app
             if (board.ownerId !== user!.id && !user!.isAdmin) {
                 set.status = 403;
                 return { error: 'Forbidden' };
+            }
+
+            // Prevent removing the owner
+            if (board.ownerId === params.userId) {
+                set.status = 400;
+                return { error: 'Cannot remove board owner' };
             }
 
             await db.delete(boardMembers)
@@ -603,8 +617,25 @@ app
         .get('/users', async ({ set }) => {
             try {
                 const allUsers = await db.select().from(users);
-                const allProjectMembers = await db.select().from(projectMembers);
-                const allBoardMembers = await db.select().from(boardMembers);
+
+                // Optimization: Use SQL aggregation instead of fetching all members
+                const projectCounts = await db.select({
+                    userId: projectMembers.userId,
+                    count: sql<number>`count(*)`
+                })
+                    .from(projectMembers)
+                    .groupBy(projectMembers.userId);
+
+                const boardCounts = await db.select({
+                    userId: boardMembers.userId,
+                    count: sql<number>`count(*)`
+                })
+                    .from(boardMembers)
+                    .groupBy(boardMembers.userId);
+
+                // Create maps for O(1) lookup
+                const projectCountMap = new Map(projectCounts.map(p => [p.userId, p.count]));
+                const boardCountMap = new Map(boardCounts.map(b => [b.userId, b.count]));
 
                 const usersWithStats = allUsers.map(u => ({
                     id: u.id,
@@ -613,8 +644,8 @@ app
                     isAdmin: u.isAdmin,
                     isBanned: u.isBanned,
                     createdAt: u.createdAt,
-                    projectsCount: allProjectMembers.filter(pm => pm.userId === u.id).length,
-                    boardsCount: allBoardMembers.filter(bm => bm.userId === u.id).length
+                    projectsCount: projectCountMap.get(u.id) || 0,
+                    boardsCount: boardCountMap.get(u.id) || 0
                 }));
 
                 return usersWithStats;
@@ -634,6 +665,12 @@ app
                 .innerJoin(projects, eq(projects.id, projectMembers.projectId))
                 .where(eq(projectMembers.userId, params.id));
 
+            if (memberProjects.length === 0) {
+                // Check if user exists if no projects found (optimization: only check on empty)
+                const userExists = await db.select().from(users).where(eq(users.id, params.id)).get();
+                if (!userExists) { set.status = 404; return { error: 'User not found' }; }
+            }
+
             const memberBoards = await db.select({
                 boardId: boardMembers.boardId,
                 title: boards.title
@@ -645,19 +682,30 @@ app
             return { projects: memberProjects, boards: memberBoards };
         })
 
-        .post('/users/:id/ban', async ({ params, set }) => {
+        .post('/users/:id/ban', async ({ params, set, user: adminUser }) => {
             const user = await db.select().from(users).where(eq(users.id, params.id)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
+
+            // Prevent self-ban
+            if (params.id === adminUser!.id) {
+                set.status = 400;
+                return { error: 'Cannot ban yourself' };
+            }
 
             // Toggle ban
             await db.update(users)
                 .set({ isBanned: !user.isBanned })
                 .where(eq(users.id, params.id));
 
+            broadcastUserUpdate(params.id);
+
             return { success: true, isBanned: !user.isBanned };
         })
 
         .patch('/users/:id/name', async ({ params, body, set }) => {
+            const user = await db.select().from(users).where(eq(users.id, params.id)).get();
+            if (!user) { set.status = 404; return { error: 'User not found' }; }
+
             await db.update(users)
                 .set({ name: body.name })
                 .where(eq(users.id, params.id));
@@ -668,9 +716,15 @@ app
 
         // Force Remove Access (Admin) - though specialized endpoints exist, these might be useful shortcuts or bulk
         // But plan said to add them:
-        .delete('/users/:id/projects/:projectId', async ({ params }) => {
+        .delete('/users/:id/projects/:projectId', async ({ params, set }) => {
+            const existing = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId))).get();
+            if (!existing) { set.status = 404; return { error: 'Membership not found' }; }
+
             await db.delete(projectMembers)
                 .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId)));
+
+            broadcastProjectUpdate(params.projectId);
 
             // Find all boards in this project and broadcast update
             const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.projectId));
@@ -681,7 +735,11 @@ app
             return { success: true };
         })
 
-        .delete('/users/:id/boards/:boardId', async ({ params }) => {
+        .delete('/users/:id/boards/:boardId', async ({ params, set }) => {
+            const existing = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId))).get();
+            if (!existing) { set.status = 404; return { error: 'Membership not found' }; }
+
             await db.delete(boardMembers)
                 .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId)));
             broadcastUpdate(params.boardId);
