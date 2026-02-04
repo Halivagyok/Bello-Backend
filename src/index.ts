@@ -6,7 +6,7 @@ import { cors } from '@elysiajs/cors';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
 import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers } from './db/schema';
-import { eq, asc, and, desc, sql } from 'drizzle-orm';
+import { eq, asc, and, desc, sql, inArray } from 'drizzle-orm';
 
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
@@ -41,7 +41,8 @@ app
         open(ws) {
             console.log('WS Connected');
         },
-        message(ws, message: any) {
+        message(ws, rawMessage: any) {
+            const message = typeof rawMessage === 'string' ? JSON.parse(rawMessage) : rawMessage;
             if (message.type === 'subscribe' && message.boardId) {
                 ws.subscribe(`board-${message.boardId}`);
                 console.log(`Subscribed to board-${message.boardId}`);
@@ -174,6 +175,7 @@ app
         if (!session || session.expiresAt < new Date()) return { user: null };
 
         const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
+        if (user?.isBanned) return { user: null };
         return { user };
     })
     .onBeforeHandle(({ user, set }) => {
@@ -364,9 +366,7 @@ app
 
             const listIds = allLists.map(l => l.id);
             const allCards = listIds.length > 0
-                // This is a bit inefficient, usually we'd do a join or whereIn
-                // But Drizzle SQLite whereIn can be tricky if list is empty
-                ? (await db.select().from(cards)).filter(c => listIds.includes(c.listId)).sort((a, b) => a.position - b.position)
+                ? await db.select().from(cards).where(inArray(cards.listId, listIds)).orderBy(asc(cards.position))
                 : [];
 
             const members = await db.select({
@@ -525,7 +525,7 @@ app
             // If moving to another list, check access to that list's board (if different - usually same board)
             if (body.listId) {
                 const newList = await db.select().from(lists).where(eq(lists.id, body.listId)).get();
-                if (!newList || !newList.boardId) return { error: 'Target list not found' };
+                if (!newList || !newList.boardId) { set.status = 404; return { error: 'Target list not found' }; }
                 const isMemberNew = await db.select().from(boardMembers)
                     .where(and(eq(boardMembers.boardId, newList.boardId), eq(boardMembers.userId, user!.id))).get();
                 if (!isMemberNew) { set.status = 403; return { error: 'Forbidden' }; }
@@ -556,7 +556,7 @@ app
             if (!card) { set.status = 404; return { error: 'Card not found' }; }
 
             const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
-            if (!list || !list.boardId) return { error: 'List error' };
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List error' }; }
 
             const isMember = await db.select().from(boardMembers)
                 .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
@@ -572,7 +572,7 @@ app
     .group('/lists', (app) => app
         .patch('/:id', async ({ params, body, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
-            if (!list || !list.boardId) return { error: 'List not found' };
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
 
             const isMember = await db.select().from(boardMembers)
                 .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
@@ -593,7 +593,7 @@ app
 
         .delete('/:id', async ({ params, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
-            if (!list || !list.boardId) return { error: 'List not found' };
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
 
             const isMember = await db.select().from(boardMembers)
                 .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();

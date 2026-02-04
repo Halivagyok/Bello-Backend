@@ -7,7 +7,7 @@ export const users = sqliteTable("users", {
     name: text("name"),
     isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
     isBanned: integer("is_banned", { mode: "boolean" }).notNull().default(false),
-    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
 export const sessions = sqliteTable("sessions", {
@@ -21,7 +21,7 @@ export const projects = sqliteTable("projects", {
     title: text("title").notNull(),
     description: text("description"),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
-    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
 export const projectMembers = sqliteTable("project_members", {
@@ -35,7 +35,7 @@ export const boards = sqliteTable("boards", {
     title: text("title").notNull(),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
     projectId: text("project_id").references(() => projects.id, { onDelete: 'set null' }),
-    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
 export const boardMembers = sqliteTable("board_members", {
@@ -49,7 +49,7 @@ export const lists = sqliteTable("lists", {
     title: text("title").notNull(),
     position: real("position").notNull().default(0),
     boardId: text("board_id").references(() => boards.id, { onDelete: 'cascade' }), // Made nullable for migration safety, but logic should enforce it
-    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
 export const cards = sqliteTable("cards", {
@@ -57,5 +57,5 @@ export const cards = sqliteTable("cards", {
     content: text("content").notNull(),
     listId: text("list_id").notNull().references(() => lists.id, { onDelete: 'cascade' }),
     position: real("position").notNull().default(0),
-    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(new Date()),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
