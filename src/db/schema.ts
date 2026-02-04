@@ -49,6 +49,7 @@ export const lists = sqliteTable("lists", {
     title: text("title").notNull(),
     position: real("position").notNull().default(0),
     boardId: text("board_id").references(() => boards.id, { onDelete: 'cascade' }), // Made nullable for migration safety, but logic should enforce it
+    color: text("color"),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 

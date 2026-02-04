@@ -438,7 +438,8 @@ app
                 id: crypto.randomUUID(),
                 title: body.title,
                 position: body.position ?? Date.now(),
-                boardId: params.id
+                boardId: params.id,
+                color: body.color
             };
             await db.insert(lists).values(newList);
             broadcastUpdate(params.id);
@@ -446,7 +447,8 @@ app
         }, {
             body: t.Object({
                 title: t.String(),
-                position: t.Optional(t.Number())
+                position: t.Optional(t.Number()),
+                color: t.Optional(t.String())
             })
         })
 
@@ -568,8 +570,104 @@ app
         })
     )
 
-    // Lists (Delete/Update)
+    // Lists (Delete/Update/Duplicate/Move/Sort)
     .group('/lists', (app) => app
+        .post('/:id/duplicate', async ({ params, body, user, set }) => {
+            const sourceList = await db.select().from(lists).where(eq(lists.id, params.id)).get();
+            if (!sourceList || !sourceList.boardId) { set.status = 404; return { error: 'List not found' }; }
+
+            const listBoardId = sourceList.boardId;
+            const isMember = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.boardId, listBoardId), eq(boardMembers.userId, user!.id))).get();
+            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const newList = {
+                id: crypto.randomUUID(),
+                title: body.title || `Copy of ${sourceList.title}`,
+                position: sourceList.position + 100,
+                boardId: listBoardId,
+                color: sourceList.color
+            };
+            await db.insert(lists).values(newList);
+
+            const sourceCards = await db.select().from(cards).where(eq(cards.listId, params.id));
+            if (sourceCards.length > 0) {
+                const newCards = sourceCards.map(c => ({
+                    id: crypto.randomUUID(),
+                    content: c.content,
+                    listId: newList.id,
+                    position: c.position,
+                    createdAt: new Date()
+                }));
+                await db.insert(cards).values(newCards);
+            }
+
+            broadcastUpdate(listBoardId);
+            return newList;
+        }, {
+            body: t.Object({ title: t.Optional(t.String()) })
+        })
+
+        .post('/:id/move-cards', async ({ params, body, user, set }) => {
+            const sourceList = await db.select().from(lists).where(eq(lists.id, params.id)).get();
+            if (!sourceList || !sourceList.boardId) { set.status = 404; return { error: 'List not found' }; }
+
+            const targetList = await db.select().from(lists).where(eq(lists.id, body.targetListId)).get();
+            if (!targetList || !targetList.boardId) { set.status = 404; return { error: 'Target list not found' }; }
+
+            const isMemberSource = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.boardId, sourceList.boardId), eq(boardMembers.userId, user!.id))).get();
+            const isMemberTarget = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.boardId, targetList.boardId), eq(boardMembers.userId, user!.id))).get();
+
+            if (!isMemberSource || !isMemberTarget) { set.status = 403; return { error: 'Forbidden' }; }
+
+            await db.update(cards)
+                .set({ listId: body.targetListId })
+                .where(eq(cards.listId, params.id));
+
+            broadcastUpdate(sourceList.boardId);
+            if (sourceList.boardId !== targetList.boardId) {
+                broadcastUpdate(targetList.boardId);
+            }
+            return { success: true };
+        }, {
+            body: t.Object({ targetListId: t.String() })
+        })
+
+        .post('/:id/sort', async ({ params, body, user, set }) => {
+            const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+
+            const isMember = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const listCards = await db.select().from(cards).where(eq(cards.listId, params.id));
+
+            if (body.sortBy === 'oldest') {
+                listCards.sort((a, b) => (a.createdAt.getTime() - b.createdAt.getTime()) || a.id.localeCompare(b.id));
+            } else if (body.sortBy === 'newest') {
+                listCards.sort((a, b) => (b.createdAt.getTime() - a.createdAt.getTime()) || b.id.localeCompare(a.id));
+            } else if (body.sortBy === 'abc') {
+                listCards.sort((a, b) => a.content.localeCompare(b.content));
+            }
+
+            // Update positions
+            const updates = [];
+            for (let i = 0; i < listCards.length; i++) {
+                updates.push(
+                    db.update(cards).set({ position: (i + 1) * 1000 }).where(eq(cards.id, listCards[i].id))
+                );
+            }
+            await Promise.all(updates);
+
+            broadcastUpdate(list.boardId);
+            return { success: true };
+        }, {
+            body: t.Object({ sortBy: t.String() })
+        })
+
         .patch('/:id', async ({ params, body, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
@@ -578,16 +676,29 @@ app
                 .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
             if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
 
+            // If changing board, check target board access
+            if (body.boardId && body.boardId !== list.boardId) {
+                const targetMember = await db.select().from(boardMembers)
+                    .where(and(eq(boardMembers.boardId, body.boardId), eq(boardMembers.userId, user!.id))).get();
+                if (!targetMember) { set.status = 403; return { error: 'Forbidden on target board' }; }
+            }
+
             const [updated] = await db.update(lists)
                 .set(body)
                 .where(eq(lists.id, params.id))
                 .returning();
+
             broadcastUpdate(list.boardId);
+            if (body.boardId && body.boardId !== list.boardId) {
+                broadcastUpdate(body.boardId);
+            }
             return updated;
         }, {
             body: t.Object({
                 title: t.Optional(t.String()),
-                position: t.Optional(t.Number())
+                position: t.Optional(t.Number()),
+                color: t.Optional(t.String()),
+                boardId: t.Optional(t.String())
             })
         })
 
