@@ -549,7 +549,8 @@ app
             body: t.Object({
                 content: t.Optional(t.String()),
                 listId: t.Optional(t.String()),
-                position: t.Optional(t.Number())
+                position: t.Optional(t.Number()),
+                completed: t.Optional(t.Boolean())
             })
         })
 

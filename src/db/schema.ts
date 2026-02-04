@@ -58,5 +58,6 @@ export const cards = sqliteTable("cards", {
     content: text("content").notNull(),
     listId: text("list_id").notNull().references(() => lists.id, { onDelete: 'cascade' }),
     position: real("position").notNull().default(0),
+    completed: integer("completed", { mode: "boolean" }).notNull().default(false),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
