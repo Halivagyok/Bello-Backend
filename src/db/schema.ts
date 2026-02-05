@@ -20,6 +20,7 @@ export const projects = sqliteTable("projects", {
     id: text("id").primaryKey(),
     title: text("title").notNull(),
     description: text("description"),
+    boardIds: text("board_ids", { mode: "json" }).$type<string[]>(),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });

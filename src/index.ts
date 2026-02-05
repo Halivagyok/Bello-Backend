@@ -243,6 +243,32 @@ app
             return { ...project, members };
         })
 
+        .patch('/:id', async ({ params, body, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            // Check Access
+            const isMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            if (project.ownerId !== user!.id && !isMember) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
+
+            await db.update(projects)
+                .set(body)
+                .where(eq(projects.id, params.id));
+
+            broadcastProjectUpdate(params.id);
+            return { success: true };
+        }, {
+            body: t.Object({
+                boardIds: t.Optional(t.Array(t.String())),
+                title: t.Optional(t.String()),
+                description: t.Optional(t.String())
+            })
+        })
+
         .post('/:id/invite', async ({ params, body, user, set }) => {
             const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
             if (!project) { set.status = 404; return { error: 'Project not found' }; }
@@ -343,6 +369,10 @@ app
             // Add owner as member
             await db.insert(boardMembers).values({ boardId: newBoard.id, userId: user!.id, role: 'admin' });
 
+            if (newBoard.projectId) {
+                broadcastProjectUpdate(newBoard.projectId);
+            }
+
             return newBoard;
         }, {
             body: t.Object({
@@ -390,6 +420,35 @@ app
             };
         })
 
+        .patch('/:id', async ({ params, body, user, set }) => {
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
+
+            // Check Access
+            const memberFn = await db.select().from(boardMembers)
+                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+
+            // Allow rename if admin or owner
+            if (!memberFn || (memberFn.role !== 'admin' && board.ownerId !== user!.id)) {
+                set.status = 403; return { error: 'Only admins can rename board' };
+            }
+
+            await db.update(boards)
+                .set(body)
+                .where(eq(boards.id, params.id));
+
+            broadcastUpdate(params.id);
+            if (board.projectId) {
+                broadcastProjectUpdate(board.projectId);
+            }
+            return { success: true };
+        }, {
+            body: t.Object({
+                title: t.Optional(t.String()),
+                projectId: t.Optional(t.String())
+            })
+        })
+
         .post('/:id/invite', async ({ params, body, user, set }) => {
             // Check if user is admin/owner
             const memberFn = await db.select().from(boardMembers)
@@ -425,6 +484,22 @@ app
 
         }, {
             body: t.Object({ email: t.String() })
+        })
+
+        .delete('/:id', async ({ params, user, set }) => {
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
+
+            if (board.ownerId !== user!.id && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
+
+            await db.delete(boards).where(eq(boards.id, params.id));
+
+            if (board.projectId) {
+                broadcastProjectUpdate(board.projectId);
+            }
+            return { success: true };
         })
 
         // --- LISTS (Scoped to Board) ---
