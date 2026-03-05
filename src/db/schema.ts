@@ -28,7 +28,7 @@ export const projects = sqliteTable("projects", {
 export const projectMembers = sqliteTable("project_members", {
     projectId: text("project_id").notNull().references(() => projects.id, { onDelete: 'cascade' }),
     userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
-    role: text("role").notNull().default('member'), // 'admin' | 'member'
+    role: text("role").notNull().default('member'), // 'owner' | 'admin' | 'member' | 'viewer'
 });
 
 export const boards = sqliteTable("boards", {
@@ -42,7 +42,7 @@ export const boards = sqliteTable("boards", {
 export const boardMembers = sqliteTable("board_members", {
     boardId: text("board_id").notNull().references(() => boards.id, { onDelete: 'cascade' }),
     userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
-    role: text("role").notNull().default('member'), // 'admin' | 'member'
+    role: text("role").notNull().default('member'), // 'owner' | 'admin' | 'member' | 'viewer'
 });
 
 export const lists = sqliteTable("lists", {
@@ -50,6 +50,7 @@ export const lists = sqliteTable("lists", {
     title: text("title").notNull(),
     position: real("position").notNull().default(0),
     boardId: text("board_id").references(() => boards.id, { onDelete: 'cascade' }), // Made nullable for migration safety, but logic should enforce it
+    ownerId: text("owner_id").references(() => users.id, { onDelete: 'set null' }),
     color: text("color"),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
@@ -57,8 +58,25 @@ export const lists = sqliteTable("lists", {
 export const cards = sqliteTable("cards", {
     id: text("id").primaryKey(),
     content: text("content").notNull(),
+    description: text("description"),
+    dueDate: integer("due_date", { mode: "timestamp" }),
+    dueDateMode: text("due_date_mode").default('full'), // 'full', 'date-only', 'time-only'
+    imageUrl: text("image_url"),
+    location: text("location"),
+    locationLat: real("location_lat"),
+    locationLng: real("location_lng"),
     listId: text("list_id").notNull().references(() => lists.id, { onDelete: 'cascade' }),
     position: real("position").notNull().default(0),
     completed: integer("completed", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
+
+export const images = sqliteTable("images", {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    filename: text("filename").notNull(),
+    originalName: text("original_name").notNull(),
+    mimeType: text("mime_type").notNull(),
+    size: integer("size").notNull(),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });

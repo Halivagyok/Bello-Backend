@@ -3,22 +3,35 @@ import { Elysia, t } from 'elysia';
 // import { websocket } from '@elysiajs/websocket'; its deprecated, built-in now
 import { swagger } from '@elysiajs/swagger';
 import { cors } from '@elysiajs/cors';
+import { staticPlugin } from '@elysiajs/static';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers } from './db/schema';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images } from './db/schema';
 import { eq, asc, and, desc, sql, inArray } from 'drizzle-orm';
+import { existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
 const db = drizzle(client);
 
-// 2. Initialize App
+const UPLOADS_DIR = join(process.cwd(), 'uploads');
+if (!existsSync(UPLOADS_DIR)) {
+    mkdirSync(UPLOADS_DIR);
+}
+
+const rolePriority: Record<string, number> = { 'owner': 4, 'admin': 3, 'member': 2, 'viewer': 1 };
+
 // 2. Initialize App
 const app = new Elysia()
     .use(cors({
         origin: 'http://localhost:5173', // Vite default port
         credentials: true,
         allowedHeaders: ['Content-Type', 'Cookie']
+    }))
+    .use(staticPlugin({
+        assets: 'uploads',
+        prefix: '/uploads'
     }));
 
 const broadcastUpdate = (boardId: string) => {
@@ -164,6 +177,23 @@ app
 
             return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         })
+
+        .patch('/me', async ({ body, cookie, set }) => {
+            const sessionId = cookie.session_id?.value;
+            if (!sessionId || typeof sessionId !== 'string') { set.status = 401; return { error: 'Unauthorized' }; }
+
+            const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+            if (!session || session.expiresAt < new Date()) { set.status = 401; return { error: 'Unauthorized' }; }
+
+            await db.update(users).set(body).where(eq(users.id, session.userId));
+            const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
+            return { user: { id: user!.id, email: user!.email, name: user!.name, isAdmin: user!.isAdmin } };
+        }, {
+            body: t.Object({
+                name: t.Optional(t.String()),
+                email: t.Optional(t.String())
+            })
+        })
     )
 
     // --- PROTECTED ROUTES ---
@@ -207,8 +237,8 @@ app
                 ownerId: user!.id,
             };
             await db.insert(projects).values(newProject);
-            // Add owner as admin member
-            await db.insert(projectMembers).values({ projectId: newProject.id, userId: user!.id, role: 'admin' });
+            // Add owner as 'owner' role
+            await db.insert(projectMembers).values({ projectId: newProject.id, userId: user!.id, role: 'owner' });
             return newProject;
         }, {
             body: t.Object({
@@ -226,7 +256,7 @@ app
             const isMember = await db.select().from(projectMembers)
                 .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
 
-            if (project.ownerId !== user!.id && !isMember) {
+            if (project.ownerId !== user!.id && !isMember && !user!.isAdmin) {
                 set.status = 403; return { error: 'Forbidden' };
             }
             const members = await db.select({
@@ -251,7 +281,11 @@ app
             const isMember = await db.select().from(projectMembers)
                 .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
 
-            if (project.ownerId !== user!.id && !isMember) {
+            // Only 'owner' or 'admin' can rename/edit project settings
+            const role = isMember?.role;
+            const canEdit = (project.ownerId === user!.id) || (role === 'owner' || role === 'admin') || user!.isAdmin;
+
+            if (!canEdit) {
                 set.status = 403; return { error: 'Forbidden' };
             }
 
@@ -273,11 +307,15 @@ app
             const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
             if (!project) { set.status = 404; return { error: 'Project not found' }; }
 
-            // Check Access (Owner or Member) - simplified, generally members can invite
+            // Check Access (Owner or Admin Member)
             const isMember = await db.select().from(projectMembers)
                 .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
 
-            if (project.ownerId !== user!.id && !isMember) {
+            const requesterRole = isMember?.role;
+            // Only 'owner' or 'admin' can invite
+            const canInvite = (project.ownerId === user!.id) || (requesterRole === 'owner' || requesterRole === 'admin') || user!.isAdmin;
+
+            if (!canInvite) {
                 set.status = 403; return { error: 'Forbidden' };
             }
 
@@ -293,7 +331,7 @@ app
             await db.insert(projectMembers).values({
                 projectId: params.id,
                 userId: targetUser.id,
-                role: 'member'
+                role: body.role || 'member'
             });
 
             // Broadcast to all boards in project
@@ -307,24 +345,87 @@ app
             return { success: true };
         }, {
             body: t.Object({
-                email: t.String()
+                email: t.String(),
+                role: t.Optional(t.String())
             })
+        })
+
+        .patch('/:id/members/:userId', async ({ params, body, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            // Only Owner or Admin can change roles
+            const requesterMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            const requesterRole = requesterMember?.role;
+            const targetMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, params.userId))).get();
+            
+            if (!targetMember) { set.status = 404; return { error: 'Member not found' }; }
+
+            // Hierarchy Check: requester must have higher priority than target AND must be owner/admin
+            const reqPrio = (project.ownerId === user!.id) ? 5 : (rolePriority[requesterRole!] || 0);
+            const targetPrio = (project.ownerId === params.userId) ? 5 : (rolePriority[targetMember.role!] || 0);
+
+            if (reqPrio < 3 || reqPrio <= targetPrio) {
+                if (!user!.isAdmin) {
+                    set.status = 403;
+                    return { error: 'Forbidden: Insufficient role hierarchy' };
+                }
+            }
+
+            // ONLY owners can grant owner role
+            if (body.role === 'owner' && reqPrio < 4 && !user!.isAdmin) {
+                set.status = 403;
+                return { error: 'Only owners can grant owner role' };
+            }
+
+            // Cannot change primary owner's role
+            if (project.ownerId === params.userId) {
+                set.status = 400;
+                return { error: 'Cannot change project owner role' };
+            }
+
+            await db.update(projectMembers)
+                .set({ role: body.role })
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, params.userId)));
+
+            broadcastProjectUpdate(params.id);
+            return { success: true };
+        }, {
+            body: t.Object({ role: t.String() })
         })
 
         .delete('/:id/members/:userId', async ({ params, user, set }) => {
             const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
             if (!project) { set.status = 404; return { error: 'Project not found' }; }
 
-            // Allow if Project Owner OR System Admin
-            if (project.ownerId !== user!.id && !user!.isAdmin) {
+            // Allow if Project Owner OR Admin Member OR System Admin
+            const requesterMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            const requesterRole = requesterMember?.role;
+            const targetMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, params.userId))).get();
+            
+            if (!targetMember) { set.status = 404; return { error: 'Member not found' }; }
+
+            const reqPrio = (project.ownerId === user!.id) ? 5 : (rolePriority[requesterRole!] || 0);
+            const targetPrio = (project.ownerId === params.userId) ? 5 : (rolePriority[targetMember.role!] || 0);
+
+            // Special case: users can remove themselves unless they are primary owner
+            const isSelf = user!.id === params.userId;
+
+            if (!isSelf && (reqPrio < 3 || reqPrio <= targetPrio) && !user!.isAdmin) {
                 set.status = 403;
                 return { error: 'Forbidden' };
             }
 
-            // Prevent removing the owner
+            // Prevent removing the primary owner
             if (project.ownerId === params.userId) {
                 set.status = 400;
-                return { error: 'Cannot remove project owner' };
+                return { error: 'Cannot remove primary project owner' };
             }
 
             await db.delete(projectMembers)
@@ -345,20 +446,38 @@ app
     // --- BOARDS ---
     .group('/boards', (app) => app
         .get('/', async ({ user }) => {
-            // Get boards where user is owner OR member
-            const memberBoards = await db.select({
-                boardId: boardMembers.boardId
-            }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
-
+            const memberBoards = await db.select({ boardId: boardMembers.boardId }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
             const boardIds = memberBoards.map(m => m.boardId);
+
+            const memberProjects = await db.select({ projectId: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
+            const projectIds = memberProjects.map(m => m.projectId);
 
             const allBoards = await db.select().from(boards);
 
-            // Return all relevant boards. Frontend will group them.
-            return allBoards.filter(b => b.ownerId === user!.id || boardIds.includes(b.id));
+            return allBoards.filter(b => 
+                b.ownerId === user!.id || 
+                boardIds.includes(b.id) || 
+                (b.projectId && projectIds.includes(b.projectId))
+            );
         })
 
-        .post('/', async ({ body, user }) => {
+        .post('/', async ({ body, user, set }) => {
+            if (body.projectId) {
+                const project = await db.select().from(projects).where(eq(projects.id, body.projectId)).get();
+                if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+                const member = await db.select().from(projectMembers)
+                    .where(and(eq(projectMembers.projectId, body.projectId), eq(projectMembers.userId, user!.id))).get();
+                
+                const role = member?.role;
+                const canCreate = (project.ownerId === user!.id) || (role === 'owner' || role === 'admin') || user!.isAdmin;
+
+                if (!canCreate) {
+                    set.status = 403;
+                    return { error: 'Forbidden: Only project owners or admins can create boards' };
+                }
+            }
+
             const newBoard = {
                 id: crypto.randomUUID(),
                 title: body.title,
@@ -366,8 +485,8 @@ app
                 ownerId: user!.id,
             };
             await db.insert(boards).values(newBoard);
-            // Add owner as member
-            await db.insert(boardMembers).values({ boardId: newBoard.id, userId: user!.id, role: 'admin' });
+            // Add owner as 'owner' role
+            await db.insert(boardMembers).values({ boardId: newBoard.id, userId: user!.id, role: 'owner' });
 
             if (newBoard.projectId) {
                 broadcastProjectUpdate(newBoard.projectId);
@@ -382,24 +501,31 @@ app
         })
 
         .get('/:id', async ({ params, user, set }) => {
-            // Check Access
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
 
-            if (!isMember) {
-                set.status = 403;
-                return { error: 'Forbidden' };
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+
+            if (board.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                if (projectMember) {
+                    if (!role || (rolePriority[projectMember.role] || 0) > (rolePriority[role] || 0)) {
+                        role = projectMember.role;
+                    }
+                }
             }
 
-            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!role && board.ownerId === user!.id) role = 'owner';
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && user!.isAdmin) role = 'owner';
+
             const allLists = await db.select().from(lists).where(eq(lists.boardId, params.id)).orderBy(asc(lists.position));
-
             const listIds = allLists.map(l => l.id);
-            const allCards = listIds.length > 0
-                ? await db.select().from(cards).where(inArray(cards.listId, listIds)).orderBy(asc(cards.position))
-                : [];
+            const allCards = listIds.length > 0 ? await db.select().from(cards).where(inArray(cards.listId, listIds)).orderBy(asc(cards.position)) : [];
 
-            const members = await db.select({
+            // Fetch direct board members
+            const directBoardMembers = await db.select({
                 id: users.id,
                 name: users.name,
                 email: users.email,
@@ -410,9 +536,41 @@ app
                 .innerJoin(users, eq(users.id, boardMembers.userId))
                 .where(eq(boardMembers.boardId, params.id));
 
+            const memberMap = new Map();
+            for (const m of directBoardMembers) {
+                memberMap.set(m.id, m);
+            }
+
+            // If it's a project board, also include project members
+            if (board.projectId) {
+                const projectMembersList = await db.select({
+                    id: users.id,
+                    name: users.name,
+                    email: users.email,
+                    role: projectMembers.role,
+                    isAdmin: users.isAdmin
+                })
+                    .from(projectMembers)
+                    .innerJoin(users, eq(users.id, projectMembers.userId))
+                    .where(eq(projectMembers.projectId, board.projectId));
+                
+                for (const pm of projectMembersList) {
+                    if (!memberMap.has(pm.id)) {
+                        memberMap.set(pm.id, pm);
+                    } else {
+                        // Keep the highest role between direct board role and project role
+                        const existing = memberMap.get(pm.id);
+                        if ((rolePriority[existing.role] || 0) < (rolePriority[pm.role] || 0)) {
+                            memberMap.set(pm.id, pm);
+                        }
+                    }
+                }
+            }
+
             return {
                 ...board,
-                members,
+                role,
+                members: Array.from(memberMap.values()),
                 lists: allLists.map(list => ({
                     ...list,
                     cards: allCards.filter(card => card.listId === list.id)
@@ -424,66 +582,26 @@ app
             const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
             if (!board) { set.status = 404; return { error: 'Board not found' }; }
 
-            // Check Access
-            const memberFn = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
-
-            // Allow rename if admin or owner
-            if (!memberFn || (memberFn.role !== 'admin' && board.ownerId !== user!.id)) {
-                set.status = 403; return { error: 'Only admins can rename board' };
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
             }
 
-            await db.update(boards)
-                .set(body)
-                .where(eq(boards.id, params.id));
+            if (rolePriority[role!] < 3 && board.ownerId !== user!.id && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
 
+            await db.update(boards).set(body).where(eq(boards.id, params.id));
             broadcastUpdate(params.id);
-            if (board.projectId) {
-                broadcastProjectUpdate(board.projectId);
-            }
+            if (board.projectId) broadcastProjectUpdate(board.projectId);
             return { success: true };
         }, {
             body: t.Object({
                 title: t.Optional(t.String()),
                 projectId: t.Optional(t.String())
             })
-        })
-
-        .post('/:id/invite', async ({ params, body, user, set }) => {
-            // Check if user is admin/owner
-            const memberFn = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
-
-            if (!memberFn || memberFn.role !== 'admin') {
-                set.status = 403;
-                return { error: 'Only admins can invite' };
-            }
-
-            const targetUser = await db.select().from(users).where(eq(users.email, body.email)).get();
-            if (!targetUser) {
-                set.status = 404;
-                return { error: 'User not found' };
-            }
-
-            // Check if already member
-            const existing = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, targetUser.id))).get();
-
-            if (existing) return { message: 'User already a member' };
-
-            await db.insert(boardMembers).values({
-                boardId: params.id,
-                userId: targetUser.id,
-                role: 'member'
-            });
-
-            broadcastUpdate(params.id);
-            broadcastUserUpdate(targetUser.id);
-
-            return { success: true };
-
-        }, {
-            body: t.Object({ email: t.String() })
         })
 
         .delete('/:id', async ({ params, user, set }) => {
@@ -495,25 +613,30 @@ app
             }
 
             await db.delete(boards).where(eq(boards.id, params.id));
-
-            if (board.projectId) {
-                broadcastProjectUpdate(board.projectId);
-            }
+            if (board.projectId) broadcastProjectUpdate(board.projectId);
             return { success: true };
         })
 
-        // --- LISTS (Scoped to Board) ---
         .post('/:id/lists', async ({ params, body, user, set }) => {
-            // Check Access
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
+
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Viewers cannot add lists' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
             const newList = {
                 id: crypto.randomUUID(),
                 title: body.title,
                 position: body.position ?? Date.now(),
                 boardId: params.id,
+                ownerId: user!.id,
                 color: body.color
             };
             await db.insert(lists).values(newList);
@@ -527,45 +650,112 @@ app
             })
         })
 
+        .patch('/:id/members/:userId', async ({ params, body, user, set }) => {
+            const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
+            if (!board) { set.status = 404; return { error: 'Board not found' }; }
+
+            // Resolve role of the requester
+            const requesterDirect = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            let requesterRole = requesterDirect?.role;
+            if (!requesterRole && board.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                requesterRole = projectMember?.role;
+            }
+
+            const reqPrio = (board.ownerId === user!.id) ? 5 : (rolePriority[requesterRole!] || 0);
+
+            // Check if target is a direct board member or project member
+            const targetDirect = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId))).get();
+            let targetPrio = 0;
+            let isProjectMember = false;
+
+            if (targetDirect) {
+                targetPrio = (board.ownerId === params.userId) ? 5 : (rolePriority[targetDirect.role] || 0);
+            } else if (board.projectId) {
+                const targetProject = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, params.userId))).get();
+                if (targetProject) {
+                    isProjectMember = true;
+                    targetPrio = (rolePriority[targetProject.role] || 0);
+                }
+            }
+
+            if (!targetDirect && !isProjectMember) {
+                set.status = 404; return { error: 'Member not found' };
+            }
+
+            // Hierarchy Check
+            if (reqPrio < 3 || reqPrio <= targetPrio) {
+                if (!user!.isAdmin) { set.status = 403; return { error: 'Forbidden: Insufficient role hierarchy' }; }
+            }
+
+            // ONLY owners can grant owner role
+            if (body.role === 'owner' && reqPrio < 4 && !user!.isAdmin) {
+                set.status = 403; return { error: 'Only owners can grant owner role' };
+            }
+
+            if (board.ownerId === params.userId) { set.status = 400; return { error: 'Cannot change board owner role' }; }
+
+            if (targetDirect) {
+                await db.update(boardMembers).set({ role: body.role }).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId)));
+            } else {
+                // If they are only a project member, update their role at the project level (workspace role)
+                await db.update(projectMembers).set({ role: body.role }).where(and(eq(projectMembers.projectId, board.projectId!), eq(projectMembers.userId, params.userId)));
+                broadcastProjectUpdate(board.projectId!);
+            }
+
+            broadcastUpdate(params.id);
+            return { success: true };
+        }, {
+            body: t.Object({ role: t.String() })
+        })
+
         .delete('/:id/members/:userId', async ({ params, user, set }) => {
             const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
             if (!board) { set.status = 404; return { error: 'Board not found' }; }
 
-            // Allow if Board Owner OR System Admin
-            if (board.ownerId !== user!.id && !user!.isAdmin) {
-                set.status = 403;
-                return { error: 'Forbidden' };
+            const requesterMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
+            let role = requesterMember?.role;
+            if (!role && board.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
             }
 
-            // Prevent removing the owner
-            if (board.ownerId === params.userId) {
-                set.status = 400;
-                return { error: 'Cannot remove board owner' };
+            const targetMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId))).get();
+            if (!targetMember) { set.status = 404; return { error: 'Member not found' }; }
+
+            const reqPrio = (board.ownerId === user!.id) ? 5 : (rolePriority[role!] || 0);
+            const targetPrio = (board.ownerId === params.userId) ? 5 : (rolePriority[targetMember.role!] || 0);
+
+            const isSelf = user!.id === params.userId;
+            if (!isSelf && (reqPrio < 3 || reqPrio <= targetPrio) && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden' };
             }
 
-            await db.delete(boardMembers)
-                .where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId)));
+            if (board.ownerId === params.userId) { set.status = 400; return { error: 'Cannot remove board owner' }; }
 
+            await db.delete(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, params.userId)));
             broadcastUpdate(params.id);
             broadcastUserUpdate(params.userId);
-
             return { success: true };
         })
     )
 
-    // --- CARDS (Global or Scoped?) ---
-    // Ideally we should scope card changes to boards too for security.
-    // simpler: check if user is member of the list's board.
+    // --- CARDS ---
     .group('/cards', (app) => app
         .post('/', async ({ body, user, set }) => {
-            // Get List to find Board
             const list = await db.select().from(lists).where(eq(lists.id, body.listId)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            // Check Access
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Viewers cannot add cards' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
             const newCard = {
                 id: crypto.randomUUID(),
@@ -574,10 +764,7 @@ app
                 position: body.position ?? Date.now()
             };
             await db.insert(cards).values(newCard);
-
-            // Broadcast
             broadcastUpdate(list.boardId);
-
             return newCard;
         }, {
             body: t.Object({
@@ -592,37 +779,64 @@ app
             if (!card) { set.status = 404; return { error: 'Card not found' }; }
 
             const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
-            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; } // should not happen
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            // Check Access to current board
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
 
-            // If moving to another list, check access to that list's board (if different - usually same board)
+            if (role === 'viewer') { set.status = 403; return { error: 'Viewers cannot edit cards' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+
+            // Source list permission check
+            const reqPrio = (board?.ownerId === user!.id) ? 5 : (rolePriority[role!] || 0);
+            if (list.ownerId && list.ownerId !== user!.id && !user!.isAdmin && reqPrio < 3) {
+                const ownerMembership = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, list.ownerId))).get();
+                const ownerPrio = (board?.ownerId === list.ownerId) ? 5 : (rolePriority[ownerMembership?.role || 'member'] || 0);
+                if (reqPrio < ownerPrio) { set.status = 403; return { error: 'Insufficient permissions on source list' }; }
+            }
+
             if (body.listId) {
                 const newList = await db.select().from(lists).where(eq(lists.id, body.listId)).get();
                 if (!newList || !newList.boardId) { set.status = 404; return { error: 'Target list not found' }; }
-                const isMemberNew = await db.select().from(boardMembers)
-                    .where(and(eq(boardMembers.boardId, newList.boardId), eq(boardMembers.userId, user!.id))).get();
-                if (!isMemberNew) { set.status = 403; return { error: 'Forbidden' }; }
+                
+                // Get role on target board
+                const targetBoard = await db.select().from(boards).where(eq(boards.id, newList.boardId)).get();
+                const directMemberNew = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, newList.boardId), eq(boardMembers.userId, user!.id))).get();
+                let roleNew = directMemberNew?.role;
+                if (!roleNew && targetBoard?.projectId) {
+                    const projectMemberNew = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, targetBoard.projectId), eq(projectMembers.userId, user!.id))).get();
+                    roleNew = projectMemberNew?.role;
+                }
+                
+                if (roleNew === 'viewer' || (!roleNew && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden on target board' }; }
+
+                // Target list ownership check
+                const reqPrioNew = (targetBoard?.ownerId === user!.id) ? 5 : (rolePriority[roleNew!] || 0);
+                if (newList.ownerId && newList.ownerId !== user!.id && !user!.isAdmin && reqPrioNew < 3) {
+                    const ownerMembershipNew = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, newList.boardId), eq(boardMembers.userId, newList.ownerId))).get();
+                    const ownerPrioNew = (targetBoard?.ownerId === newList.ownerId) ? 5 : (rolePriority[ownerMembershipNew?.role || 'member'] || 0);
+                    if (reqPrioNew < ownerPrioNew) { set.status = 403; return { error: 'Insufficient permissions on target list' }; }
+                }
             }
 
-            const [updated] = await db.update(cards)
-                .set(body)
-                .where(eq(cards.id, params.id))
-                .returning();
-
-            // Broadcast
+            const [updated] = await db.update(cards).set(body).where(eq(cards.id, params.id)).returning();
             broadcastUpdate(list.boardId);
-            if (body.listId && body.listId !== card.listId) {
-                // Potentially broadcast to old board if moving boards, but for now assum same board
-            }
-
             return updated;
         }, {
             body: t.Object({
                 content: t.Optional(t.String()),
+                description: t.Optional(t.Nullable(t.String())),
+                dueDate: t.Optional(t.Nullable(t.Date())),
+                dueDateMode: t.Optional(t.Nullable(t.String())),
+                imageUrl: t.Optional(t.Nullable(t.String())),
+                location: t.Optional(t.Nullable(t.String())),
+                locationLat: t.Optional(t.Nullable(t.Number())),
+                locationLng: t.Optional(t.Nullable(t.Number())),
                 listId: t.Optional(t.String()),
                 position: t.Optional(t.Number()),
                 completed: t.Optional(t.Boolean())
@@ -635,10 +849,17 @@ app
 
             const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List error' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
             await db.delete(cards).where(eq(cards.id, params.id));
             broadcastUpdate(list.boardId);
@@ -646,22 +867,31 @@ app
         })
     )
 
-    // Lists (Delete/Update/Duplicate/Move/Sort)
+    // --- LISTS ---
     .group('/lists', (app) => app
         .post('/:id/duplicate', async ({ params, body, user, set }) => {
             const sourceList = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!sourceList || !sourceList.boardId) { set.status = 404; return { error: 'List not found' }; }
 
             const listBoardId = sourceList.boardId;
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, listBoardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, listBoardId)).get();
+
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, listBoardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
             const newList = {
                 id: crypto.randomUUID(),
                 title: body.title || `Copy of ${sourceList.title}`,
                 position: sourceList.position + 100,
                 boardId: listBoardId,
+                ownerId: user!.id,
                 color: sourceList.color
             };
             await db.insert(lists).values(newList);
@@ -691,21 +921,36 @@ app
             const targetList = await db.select().from(lists).where(eq(lists.id, body.targetListId)).get();
             if (!targetList || !targetList.boardId) { set.status = 404; return { error: 'Target list not found' }; }
 
-            const isMemberSource = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, sourceList.boardId), eq(boardMembers.userId, user!.id))).get();
-            const isMemberTarget = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, targetList.boardId), eq(boardMembers.userId, user!.id))).get();
+            const sourceBoard = await db.select().from(boards).where(eq(boards.id, sourceList.boardId)).get();
+            const targetBoard = await db.select().from(boards).where(eq(boards.id, targetList.boardId)).get();
 
-            if (!isMemberSource || !isMemberTarget) { set.status = 403; return { error: 'Forbidden' }; }
-
-            await db.update(cards)
-                .set({ listId: body.targetListId })
-                .where(eq(cards.listId, params.id));
-
-            broadcastUpdate(sourceList.boardId);
-            if (sourceList.boardId !== targetList.boardId) {
-                broadcastUpdate(targetList.boardId);
+            const directMemberSrc = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, sourceList.boardId), eq(boardMembers.userId, user!.id))).get();
+            let roleSrc = directMemberSrc?.role;
+            if (!roleSrc && sourceBoard?.projectId) {
+                const projectMemberSrc = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, sourceBoard.projectId), eq(projectMembers.userId, user!.id))).get();
+                roleSrc = projectMemberSrc?.role;
             }
+
+            const directMemberTgt = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, targetList.boardId), eq(boardMembers.userId, user!.id))).get();
+            let roleTgt = directMemberTgt?.role;
+            if (!roleTgt && targetBoard?.projectId) {
+                const projectMemberTgt = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, targetBoard.projectId), eq(projectMembers.userId, user!.id))).get();
+                roleTgt = projectMemberTgt?.role;
+            }
+
+            if (roleSrc === 'viewer' || roleTgt === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if ((!roleSrc || !roleTgt) && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const reqPrio = (sourceBoard?.ownerId === user!.id) ? 5 : (rolePriority[roleSrc!] || 0);
+            if (sourceList.ownerId && sourceList.ownerId !== user!.id && !user!.isAdmin && reqPrio < 3) {
+                const ownerMembership = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, sourceList.boardId), eq(boardMembers.userId, sourceList.ownerId))).get();
+                const ownerPrio = (sourceBoard?.ownerId === sourceList.ownerId) ? 5 : (rolePriority[ownerMembership?.role || 'member'] || 0);
+                if (reqPrio <= ownerPrio) { set.status = 403; return { error: 'Insufficient permissions' }; }
+            }
+
+            await db.update(cards).set({ listId: body.targetListId }).where(eq(cards.listId, params.id));
+            broadcastUpdate(sourceList.boardId);
+            if (sourceList.boardId !== targetList.boardId) broadcastUpdate(targetList.boardId);
             return { success: true };
         }, {
             body: t.Object({ targetListId: t.String() })
@@ -714,30 +959,32 @@ app
         .post('/:id/sort', async ({ params, body, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const reqPrio = (board?.ownerId === user!.id) ? 5 : (rolePriority[role!] || 0);
+            if (list.ownerId && list.ownerId !== user!.id && !user!.isAdmin && reqPrio < 3) {
+                const ownerMembership = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, list.ownerId))).get();
+                const ownerPrio = (board?.ownerId === list.ownerId) ? 5 : (rolePriority[ownerMembership?.role || 'member'] || 0);
+                if (reqPrio <= ownerPrio) { set.status = 403; return { error: 'Insufficient permissions' }; }
+            }
 
             const listCards = await db.select().from(cards).where(eq(cards.listId, params.id));
+            if (body.sortBy === 'oldest') listCards.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+            else if (body.sortBy === 'newest') listCards.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
+            else if (body.sortBy === 'abc') listCards.sort((a, b) => a.content.localeCompare(b.content));
 
-            if (body.sortBy === 'oldest') {
-                listCards.sort((a, b) => (a.createdAt.getTime() - b.createdAt.getTime()) || a.id.localeCompare(b.id));
-            } else if (body.sortBy === 'newest') {
-                listCards.sort((a, b) => (b.createdAt.getTime() - a.createdAt.getTime()) || b.id.localeCompare(a.id));
-            } else if (body.sortBy === 'abc') {
-                listCards.sort((a, b) => a.content.localeCompare(b.content));
-            }
-
-            // Update positions
-            const updates = [];
-            for (let i = 0; i < listCards.length; i++) {
-                updates.push(
-                    db.update(cards).set({ position: (i + 1) * 1000 }).where(eq(cards.id, listCards[i].id))
-                );
-            }
+            const updates = listCards.map((c, i) => db.update(cards).set({ position: (i + 1) * 1000 }).where(eq(cards.id, c.id)));
             await Promise.all(updates);
-
             broadcastUpdate(list.boardId);
             return { success: true };
         }, {
@@ -747,27 +994,39 @@ app
         .patch('/:id', async ({ params, body, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
-
-            // If changing board, check target board access
-            if (body.boardId && body.boardId !== list.boardId) {
-                const targetMember = await db.select().from(boardMembers)
-                    .where(and(eq(boardMembers.boardId, body.boardId), eq(boardMembers.userId, user!.id))).get();
-                if (!targetMember) { set.status = 403; return { error: 'Forbidden on target board' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
             }
 
-            const [updated] = await db.update(lists)
-                .set(body)
-                .where(eq(lists.id, params.id))
-                .returning();
+            if (role === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
+            const reqPrio = (board?.ownerId === user!.id) ? 5 : (rolePriority[role!] || 0);
+            if (list.ownerId && list.ownerId !== user!.id && !user!.isAdmin && reqPrio < 3) {
+                const ownerMembership = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, list.ownerId))).get();
+                const ownerPrio = (board?.ownerId === list.ownerId) ? 5 : (rolePriority[ownerMembership?.role || 'member'] || 0);
+                if (reqPrio <= ownerPrio) { set.status = 403; return { error: 'Insufficient permissions' }; }
+            }
+
+            if (body.boardId && body.boardId !== list.boardId) {
+                const targetBoard = await db.select().from(boards).where(eq(boards.id, body.boardId)).get();
+                const directMemberTgt = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, body.boardId), eq(boardMembers.userId, user!.id))).get();
+                let roleTgt = directMemberTgt?.role;
+                if (!roleTgt && targetBoard?.projectId) {
+                    const projectMemberTgt = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, targetBoard.projectId), eq(projectMembers.userId, user!.id))).get();
+                    roleTgt = projectMemberTgt?.role;
+                }
+                if (roleTgt === 'viewer' || (!roleTgt && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden on target board' }; }
+            }
+
+            const [updated] = await db.update(lists).set(body).where(eq(lists.id, params.id)).returning();
             broadcastUpdate(list.boardId);
-            if (body.boardId && body.boardId !== list.boardId) {
-                broadcastUpdate(body.boardId);
-            }
+            if (body.boardId && body.boardId !== list.boardId) broadcastUpdate(body.boardId);
             return updated;
         }, {
             body: t.Object({
@@ -778,13 +1037,53 @@ app
             })
         })
 
+        .patch('/:id/owner', async ({ params, body, user, set }) => {
+            const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
+            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
+
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            const isBoardOwner = board?.ownerId === user!.id;
+            const isBoardAdmin = (rolePriority[role!] || 0) >= 3;
+
+            if (!isBoardOwner && !isBoardAdmin && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden: Only board admins or higher can transfer list ownership' };
+            }
+
+            await db.update(lists).set({ ownerId: body.ownerId }).where(eq(lists.id, params.id));
+            broadcastUpdate(list.boardId);
+            return { success: true };
+        }, {
+            body: t.Object({ ownerId: t.String() })
+        })
+
         .delete('/:id', async ({ params, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
+            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
 
-            const isMember = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            if (!isMember) { set.status = 403; return { error: 'Forbidden' }; }
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+
+            if (role === 'viewer') { set.status = 403; return { error: 'Forbidden' }; }
+            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const reqPrio = (board?.ownerId === user!.id) ? 5 : (rolePriority[role!] || 0);
+            if (list.ownerId && list.ownerId !== user!.id && !user!.isAdmin && reqPrio < 3) {
+                const ownerMembership = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, list.ownerId))).get();
+                const ownerPrio = (board?.ownerId === list.ownerId) ? 5 : (rolePriority[ownerMembership?.role || 'member'] || 0);
+                if (reqPrio <= ownerPrio) { set.status = 403; return { error: 'Insufficient permissions' }; }
+            }
 
             await db.delete(lists).where(eq(lists.id, params.id));
             broadcastUpdate(list.boardId);
@@ -804,27 +1103,13 @@ app
         .get('/users', async ({ set }) => {
             try {
                 const allUsers = await db.select().from(users);
+                const projectCounts = await db.select({ userId: projectMembers.userId, count: sql<number>`count(*)` }).from(projectMembers).groupBy(projectMembers.userId);
+                const boardCounts = await db.select({ userId: boardMembers.userId, count: sql<number>`count(*)` }).from(boardMembers).groupBy(boardMembers.userId);
 
-                // Optimization: Use SQL aggregation instead of fetching all members
-                const projectCounts = await db.select({
-                    userId: projectMembers.userId,
-                    count: sql<number>`count(*)`
-                })
-                    .from(projectMembers)
-                    .groupBy(projectMembers.userId);
-
-                const boardCounts = await db.select({
-                    userId: boardMembers.userId,
-                    count: sql<number>`count(*)`
-                })
-                    .from(boardMembers)
-                    .groupBy(boardMembers.userId);
-
-                // Create maps for O(1) lookup
                 const projectCountMap = new Map(projectCounts.map(p => [p.userId, p.count]));
                 const boardCountMap = new Map(boardCounts.map(b => [b.userId, b.count]));
 
-                const usersWithStats = allUsers.map(u => ({
+                return allUsers.map(u => ({
                     id: u.id,
                     name: u.name,
                     email: u.email,
@@ -834,8 +1119,6 @@ app
                     projectsCount: projectCountMap.get(u.id) || 0,
                     boardsCount: boardCountMap.get(u.id) || 0
                 }));
-
-                return usersWithStats;
             } catch (e) {
                 console.error(e);
                 set.status = 500;
@@ -844,101 +1127,97 @@ app
         })
 
         .get('/users/:id/access', async ({ params, set }) => {
-            const memberProjects = await db.select({
-                projectId: projectMembers.projectId,
-                title: projects.title
-            })
-                .from(projectMembers)
-                .innerJoin(projects, eq(projects.id, projectMembers.projectId))
-                .where(eq(projectMembers.userId, params.id));
-
-            if (memberProjects.length === 0) {
-                // Check if user exists if no projects found (optimization: only check on empty)
-                const userExists = await db.select().from(users).where(eq(users.id, params.id)).get();
-                if (!userExists) { set.status = 404; return { error: 'User not found' }; }
-            }
-
-            const memberBoards = await db.select({
-                boardId: boardMembers.boardId,
-                title: boards.title
-            })
-                .from(boardMembers)
-                .innerJoin(boards, eq(boards.id, boardMembers.boardId))
-                .where(eq(boardMembers.userId, params.id));
-
+            const memberProjects = await db.select({ projectId: projectMembers.projectId, title: projects.title }).from(projectMembers).innerJoin(projects, eq(projects.id, projectMembers.projectId)).where(eq(projectMembers.userId, params.id));
+            const memberBoards = await db.select({ boardId: boardMembers.boardId, title: boards.title }).from(boardMembers).innerJoin(boards, eq(boards.id, boardMembers.boardId)).where(eq(boardMembers.userId, params.id));
             return { projects: memberProjects, boards: memberBoards };
         })
 
         .post('/users/:id/ban', async ({ params, set, user: adminUser }) => {
             const user = await db.select().from(users).where(eq(users.id, params.id)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
-
-            // Prevent self-ban
-            if (params.id === adminUser!.id) {
-                set.status = 400;
-                return { error: 'Cannot ban yourself' };
-            }
-
-            // Toggle ban
-            await db.update(users)
-                .set({ isBanned: !user.isBanned })
-                .where(eq(users.id, params.id));
-
+            if (params.id === adminUser!.id) { set.status = 400; return { error: 'Cannot ban yourself' }; }
+            await db.update(users).set({ isBanned: !user.isBanned }).where(eq(users.id, params.id));
             broadcastUserUpdate(params.id);
-
             return { success: true, isBanned: !user.isBanned };
         })
 
         .patch('/users/:id/name', async ({ params, body, set }) => {
             const user = await db.select().from(users).where(eq(users.id, params.id)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
-
-            await db.update(users)
-                .set({ name: body.name })
-                .where(eq(users.id, params.id));
+            await db.update(users).set({ name: body.name }).where(eq(users.id, params.id));
             return { success: true };
         }, {
             body: t.Object({ name: t.String() })
         })
 
-        // Force Remove Access (Admin) - though specialized endpoints exist, these might be useful shortcuts or bulk
-        // But plan said to add them:
         .delete('/users/:id/projects/:projectId', async ({ params, set }) => {
-            const existing = await db.select().from(projectMembers)
-                .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId))).get();
-            if (!existing) { set.status = 404; return { error: 'Membership not found' }; }
-
-            await db.delete(projectMembers)
-                .where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId)));
-
+            await db.delete(projectMembers).where(and(eq(projectMembers.userId, params.id), eq(projectMembers.projectId, params.projectId)));
             broadcastProjectUpdate(params.projectId);
-
-            // Find all boards in this project and broadcast update
             const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.projectId));
-            for (const board of projectBoards) {
-                broadcastUpdate(board.id);
-            }
+            for (const board of projectBoards) broadcastUpdate(board.id);
             broadcastUserUpdate(params.id);
             return { success: true };
         })
 
-        .delete('/users/:id/boards/:boardId', async ({ params, set }) => {
-            const existing = await db.select().from(boardMembers)
-                .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId))).get();
-            if (!existing) { set.status = 404; return { error: 'Membership not found' }; }
-
-            await db.delete(boardMembers)
-                .where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId)));
+        .delete('/:id/boards/:boardId', async ({ params, set }) => {
+            await db.delete(boardMembers).where(and(eq(boardMembers.userId, params.id), eq(boardMembers.boardId, params.boardId)));
             broadcastUpdate(params.boardId);
             broadcastUserUpdate(params.id);
             return { success: true };
         })
-    )
+        )
 
-    .get('/api/ping', () => ({ message: "Backend Connected! 🚀" }))
+        // --- IMAGES ---
+        .group('/images', (app) => app
+        .get('/', async ({ user }) => {
+            return await db.select().from(images).where(eq(images.userId, user!.id)).orderBy(desc(images.createdAt));
+        })
 
+        .post('/', async ({ body, user, set }) => {
+            const file = body.file as File;
+            const id = crypto.randomUUID();
+            const extension = file.name.split('.').pop();
+            const filename = `${id}.${extension}`;
+            const path = join(UPLOADS_DIR, filename);
+
+            await Bun.write(path, file);
+
+            const newImage = {
+                id,
+                userId: user!.id,
+                filename,
+                originalName: file.name,
+                mimeType: file.type,
+                size: file.size
+            };
+
+            await db.insert(images).values(newImage);
+            return newImage;
+        }, {
+            body: t.Object({
+                file: t.File()
+            })
+        })
+
+        .delete('/:id', async ({ params, user, set }) => {
+            const image = await db.select().from(images).where(and(eq(images.id, params.id), eq(images.userId, user!.id))).get();
+            if (!image) { set.status = 404; return { error: 'Image not found' }; }
+
+            const path = join(UPLOADS_DIR, image.filename);
+            try {
+                const { unlink } = await import('fs/promises');
+                await unlink(path);
+            } catch (e) {
+                console.error('Failed to delete file:', e);
+            }
+
+            await db.delete(images).where(eq(images.id, params.id));
+            return { success: true };
+        })
+        )
+
+        .get('/api/ping', () => ({ message: "Backend Connected! 🚀" }))
     .listen(3000);
 
 export type App = typeof app;
-
 console.log(`🦊 Backend running at http://localhost:3000`);
