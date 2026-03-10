@@ -111,15 +111,15 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: false } };
-        }, {
+            // 4. Return new user
+            return { user: { id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
+            }, {
             body: t.Object({
                 email: t.String(),
                 password: t.String(),
                 name: t.Optional(t.String())
             })
-        })
-
+            })
         .post('/login', async ({ body, set }) => {
             const user = await db.select().from(users).where(eq(users.email, body.email)).get();
             if (!user) {
@@ -175,7 +175,7 @@ app
             if (!user) return { user: null };
             if (user.isBanned) return { user: null };
 
-            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
+            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin } };
         })
 
         .patch('/me', async ({ body, cookie, set }) => {
@@ -187,11 +187,38 @@ app
 
             await db.update(users).set(body).where(eq(users.id, session.userId));
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
-            return { user: { id: user!.id, email: user!.email, name: user!.name, isAdmin: user!.isAdmin } };
+            return { user: { id: user!.id, email: user!.email, name: user!.name, avatarUrl: user!.avatarUrl, isAdmin: user!.isAdmin } };
         }, {
             body: t.Object({
                 name: t.Optional(t.String()),
-                email: t.Optional(t.String())
+                email: t.Optional(t.String()),
+                avatarUrl: t.Optional(t.Nullable(t.String()))
+            })
+        })
+
+        .patch('/password', async ({ body, cookie, set }) => {
+            const sessionId = cookie.session_id?.value;
+            if (!sessionId || typeof sessionId !== 'string') { set.status = 401; return { error: 'Unauthorized' }; }
+
+            const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+            if (!session || session.expiresAt < new Date()) { set.status = 401; return { error: 'Unauthorized' }; }
+
+            const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
+            if (!user) { set.status = 404; return { error: 'User not found' }; }
+
+            // Verify current password
+            const isMatch = await Bun.password.verify(body.currentPassword, user.password);
+            if (!isMatch) { set.status = 400; return { error: 'Incorrect current password' }; }
+
+            // Hash and update new password
+            const hashedPassword = await Bun.password.hash(body.newPassword);
+            await db.update(users).set({ password: hashedPassword }).where(eq(users.id, user.id));
+
+            return { success: true };
+        }, {
+            body: t.Object({
+                currentPassword: t.String(),
+                newPassword: t.String()
             })
         })
     )
