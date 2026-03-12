@@ -25,13 +25,19 @@ const rolePriority: Record<string, number> = { 'owner': 4, 'admin': 3, 'member':
 // 2. Initialize App
 const app = new Elysia()
     .use(cors({
-        origin: 'http://localhost:5173', // Vite default port
+        origin: true, // Mirror the requester's origin for development
         credentials: true,
         allowedHeaders: ['Content-Type', 'Cookie']
     }))
     .use(staticPlugin({
         assets: 'uploads',
-        prefix: '/uploads'
+        prefix: '/uploads',
+        alwaysStatic: false,
+        headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=31536000',
+            'Cross-Origin-Resource-Policy': 'cross-origin'
+        }
     }));
 
 const broadcastUpdate = (boardId: string) => {
@@ -235,7 +241,10 @@ app
         if (user?.isBanned) return { user: null };
         return { user };
     })
-    .onBeforeHandle(({ user, set }) => {
+    .onBeforeHandle(({ path, user, set }) => {
+        if (path.startsWith('/uploads') || path.startsWith('/auth') || path === '/api/ping') {
+            return;
+        }
         if (!user) {
             set.status = 401;
             return { error: 'Unauthorized' };
@@ -290,6 +299,7 @@ app
                 id: users.id,
                 name: users.name,
                 email: users.email,
+                avatarUrl: users.avatarUrl,
                 role: projectMembers.role,
                 isAdmin: users.isAdmin
             })
@@ -479,7 +489,17 @@ app
             const memberProjects = await db.select({ projectId: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
             const projectIds = memberProjects.map(m => m.projectId);
 
-            const allBoards = await db.select().from(boards);
+            const allBoards = await db.select({
+                id: boards.id,
+                title: boards.title,
+                ownerId: boards.ownerId,
+                projectId: boards.projectId,
+                createdAt: boards.createdAt,
+                ownerAvatarUrl: users.avatarUrl,
+                ownerName: users.name
+            })
+                .from(boards)
+                .innerJoin(users, eq(users.id, boards.ownerId));
 
             return allBoards.filter(b => 
                 b.ownerId === user!.id || 
@@ -551,11 +571,11 @@ app
             const listIds = allLists.map(l => l.id);
             const allCards = listIds.length > 0 ? await db.select().from(cards).where(inArray(cards.listId, listIds)).orderBy(asc(cards.position)) : [];
 
-            // Fetch direct board members
             const directBoardMembers = await db.select({
                 id: users.id,
                 name: users.name,
                 email: users.email,
+                avatarUrl: users.avatarUrl,
                 role: boardMembers.role,
                 isAdmin: users.isAdmin
             })
@@ -574,6 +594,7 @@ app
                     id: users.id,
                     name: users.name,
                     email: users.email,
+                    avatarUrl: users.avatarUrl,
                     role: projectMembers.role,
                     isAdmin: users.isAdmin
                 })
