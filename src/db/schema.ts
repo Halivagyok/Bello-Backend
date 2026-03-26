@@ -37,6 +37,7 @@ export const boards = sqliteTable("boards", {
     title: text("title").notNull(),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
     projectId: text("project_id").references(() => projects.id, { onDelete: 'set null' }),
+    visibility: text("visibility").notNull().default('workspace'), // 'private' | 'workspace' | 'public'
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 

@@ -15,6 +15,26 @@ import { join } from 'path';
 const client = createClient({ url: 'file:bello.db' });
 const db = drizzle(client);
 
+const initializeDefaultLabels = async () => {
+    try {
+        const existingGlobalLabels = await db.select().from(labels).where(isNull(labels.projectId));
+        if (existingGlobalLabels.length === 0) {
+            await db.insert(labels).values([
+                { id: crypto.randomUUID(), title: 'Priority', color: '#ef4444' }, // Red
+                { id: crypto.randomUUID(), title: 'Help Required', color: '#f59e0b' }, // Amber/Orange
+                { id: crypto.randomUUID(), title: 'Bug', color: '#dc2626' }, // Dark Red
+                { id: crypto.randomUUID(), title: 'Feature', color: '#3b82f6' }, // Blue
+                { id: crypto.randomUUID(), title: 'Design', color: '#ec4899' }, // Pink
+                { id: crypto.randomUUID(), title: 'Done', color: '#10b981' } // Green
+            ]);
+            console.log('Default global labels initialized successfully.');
+        }
+    } catch (e) {
+        console.error('Failed to initialize default labels. Did you run the database migration?', e);
+    }
+};
+initializeDefaultLabels();
+
 const UPLOADS_DIR = join(process.cwd(), 'uploads');
 if (!existsSync(UPLOADS_DIR)) {
     mkdirSync(UPLOADS_DIR);
@@ -118,7 +138,7 @@ app
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
             // 4. Return new user
-            return { user: { id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
+            return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
             }, {
             body: t.Object({
                 email: t.String(),
@@ -241,8 +261,12 @@ app
         if (user?.isBanned) return { user: null };
         return { user };
     })
-    .onBeforeHandle(({ path, user, set }) => {
+    .onBeforeHandle(({ path, request, user, set }) => {
         if (path.startsWith('/uploads') || path.startsWith('/auth') || path === '/api/ping') {
+            return;
+        }
+        const isPublicBoardRequest = path.match(/^\/boards\/[^\/]+$/) && request.method === 'GET';
+        if (isPublicBoardRequest) {
             return;
         }
         if (!user) {
@@ -510,14 +534,15 @@ app
             const memberBoards = await db.select({ boardId: boardMembers.boardId }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
             const boardIds = memberBoards.map(m => m.boardId);
 
-            const memberProjects = await db.select({ projectId: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
-            const projectIds = memberProjects.map(m => m.projectId);
+            const memberProjects = await db.select({ projectId: projectMembers.projectId, role: projectMembers.role }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
+            const projectRoles = new Map(memberProjects.map(m => [m.projectId, m.role]));
 
             const allBoards = await db.select({
                 id: boards.id,
                 title: boards.title,
                 ownerId: boards.ownerId,
                 projectId: boards.projectId,
+                visibility: boards.visibility,
                 createdAt: boards.createdAt,
                 ownerAvatarUrl: users.avatarUrl,
                 ownerName: users.name
@@ -525,11 +550,19 @@ app
                 .from(boards)
                 .innerJoin(users, eq(users.id, boards.ownerId));
 
-            return allBoards.filter(b => 
-                b.ownerId === user!.id || 
-                boardIds.includes(b.id) || 
-                (b.projectId && projectIds.includes(b.projectId))
-            );
+            return allBoards.filter(b => {
+                if (b.ownerId === user!.id) return true;
+                if (boardIds.includes(b.id)) return true;
+                
+                if (b.projectId && projectRoles.has(b.projectId)) {
+                    if (b.visibility === 'private') {
+                        const pRole = projectRoles.get(b.projectId);
+                        return pRole === 'owner' || pRole === 'admin';
+                    }
+                    return true;
+                }
+                return false;
+            });
         })
 
         .post('/', async ({ body, user, set }) => {
@@ -554,6 +587,7 @@ app
                 title: body.title,
                 projectId: body.projectId,
                 ownerId: user!.id,
+                visibility: body.visibility || 'workspace',
             };
             await db.insert(boards).values(newBoard);
             // Add owner as 'owner' role
@@ -567,7 +601,8 @@ app
         }, {
             body: t.Object({
                 title: t.String(),
-                projectId: t.Optional(t.String())
+                projectId: t.Optional(t.String()),
+                visibility: t.Optional(t.String())
             })
         })
 
@@ -575,21 +610,37 @@ app
             const board = await db.select().from(boards).where(eq(boards.id, params.id)).get();
             if (!board) { set.status = 404; return { error: 'Board not found' }; }
 
-            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user!.id))).get();
-            let role = directMember?.role;
-
-            if (board.projectId) {
-                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
-                if (projectMember) {
-                    if (!role || (rolePriority[projectMember.role] || 0) > (rolePriority[role] || 0)) {
-                        role = projectMember.role;
-                    }
-                }
+            if (board.visibility !== 'public' && !user) {
+                set.status = 401; return { error: 'Unauthorized' };
             }
 
-            if (!role && board.ownerId === user!.id) role = 'owner';
-            if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
-            if (!role && user!.isAdmin) role = 'owner';
+            let role: string | undefined | null = null;
+            if (user) {
+                const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, params.id), eq(boardMembers.userId, user.id))).get();
+                role = directMember?.role;
+    
+                if (board.projectId) {
+                    const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user.id))).get();
+                    if (projectMember) {
+                        if (board.visibility === 'private') {
+                            if (projectMember.role === 'owner' || projectMember.role === 'admin') {
+                                if (!role || (rolePriority[projectMember.role] || 0) > (rolePriority[role] || 0)) {
+                                    role = projectMember.role;
+                                }
+                            }
+                        } else {
+                            if (!role || (rolePriority[projectMember.role] || 0) > (rolePriority[role] || 0)) {
+                                role = projectMember.role;
+                            }
+                        }
+                    }
+                }
+    
+                if (!role && board.ownerId === user.id) role = 'owner';
+                if (!role && user.isAdmin) role = 'owner';
+            }
+
+            if (board.visibility !== 'public' && !role) { set.status = 403; return { error: 'Forbidden' }; }
 
             const allLists = await db.select().from(lists).where(eq(lists.boardId, params.id)).orderBy(asc(lists.position));
             const listIds = allLists.map(l => l.id);
@@ -689,7 +740,8 @@ app
         }, {
             body: t.Object({
                 title: t.Optional(t.String()),
-                projectId: t.Optional(t.String())
+                projectId: t.Optional(t.String()),
+                visibility: t.Optional(t.String())
             })
         })
 
