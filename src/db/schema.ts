@@ -81,3 +81,16 @@ export const images = sqliteTable("images", {
     size: integer("size").notNull(),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
+
+export const labels = sqliteTable("labels", {
+    id: text("id").primaryKey(),
+    title: text("title").notNull(),
+    color: text("color").notNull(),
+    projectId: text("project_id").references(() => projects.id, { onDelete: 'cascade' }),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
+
+export const cardLabels = sqliteTable("card_labels", {
+    cardId: text("card_id").notNull().references(() => cards.id, { onDelete: 'cascade' }),
+    labelId: text("label_id").notNull().references(() => labels.id, { onDelete: 'cascade' }),
+});

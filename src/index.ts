@@ -6,8 +6,8 @@ import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images } from './db/schema';
-import { eq, asc, and, desc, sql, inArray } from 'drizzle-orm';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels } from './db/schema';
+import { eq, asc, and, desc, sql, inArray, like, or, isNull } from 'drizzle-orm';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -281,6 +281,30 @@ app
                 title: t.String(),
                 description: t.Optional(t.String())
             })
+        })
+
+        .get('/:id/labels', async ({ params, user, set }) => {
+            const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!projectMember && project?.ownerId !== user!.id && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+            return await db.select().from(labels).where(or(eq(labels.projectId, params.id), isNull(labels.projectId)));
+        })
+
+        .post('/:id/labels', async ({ params, body, user, set }) => {
+            const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!projectMember && project?.ownerId !== user!.id && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+            const newLabel = {
+                id: crypto.randomUUID(),
+                title: body.title,
+                color: body.color,
+                projectId: params.id
+            };
+            await db.insert(labels).values(newLabel);
+            broadcastProjectUpdate(params.id);
+            return newLabel;
+        }, {
+            body: t.Object({ title: t.String(), color: t.String() })
         })
 
         // Get Project Details (including BOARDS in that project)
@@ -615,13 +639,30 @@ app
                 }
             }
 
+            const cardIds = allCards.map(c => c.id);
+            const allCardLabels = cardIds.length > 0 ? await db.select({
+                cardId: cardLabels.cardId,
+                labelId: labels.id,
+                title: labels.title,
+                color: labels.color
+            }).from(cardLabels)
+              .innerJoin(labels, eq(labels.id, cardLabels.labelId))
+              .where(inArray(cardLabels.cardId, cardIds)) : [];
+
             return {
                 ...board,
                 role,
                 members: Array.from(memberMap.values()),
                 lists: allLists.map(list => ({
                     ...list,
-                    cards: allCards.filter(card => card.listId === list.id)
+                    cards: allCards.filter(card => card.listId === list.id).map(card => ({
+                        ...card,
+                        labels: allCardLabels.filter(cl => cl.cardId === card.id).map(cl => ({
+                            id: cl.labelId,
+                            title: cl.title,
+                            color: cl.color
+                        }))
+                    }))
                 }))
             };
         })
@@ -790,6 +831,108 @@ app
 
     // --- CARDS ---
     .group('/cards', (app) => app
+        .get('/search', async ({ query, user, set }) => {
+            const q = query.q?.trim().toLowerCase() || '';
+            const dueSoon = query.dueSoon === 'true';
+
+            if (!q && !dueSoon) return [];
+
+            // 1. Get member boards
+            const memberBoards = await db.select({ boardId: boardMembers.boardId }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
+            const boardIds = memberBoards.map(m => m.boardId);
+
+            // 2. Get member projects
+            const memberProjects = await db.select({ projectId: projectMembers.projectId }).from(projectMembers).where(eq(projectMembers.userId, user!.id));
+            const projectIds = memberProjects.map(m => m.projectId);
+
+            // 3. Find accessible boards
+            const allBoardsList = await db.select({ id: boards.id, ownerId: boards.ownerId, projectId: boards.projectId }).from(boards);
+            const accessibleBoardIds = allBoardsList
+                .filter(b => b.ownerId === user!.id || boardIds.includes(b.id) || (b.projectId && projectIds.includes(b.projectId)))
+                .map(b => b.id);
+
+            if (accessibleBoardIds.length === 0) return [];
+
+            // 4. Find lists in accessible boards
+            const accessibleLists = await db.select({ id: lists.id }).from(lists).where(inArray(lists.boardId, accessibleBoardIds));
+            const accessibleListIds = accessibleLists.map(l => l.id);
+
+            if (accessibleListIds.length === 0) return [];
+
+            // 5. Build dynamic search conditions
+            const conditions: any[] = [inArray(cards.listId, accessibleListIds)];
+            
+            if (q) {
+                conditions.push(
+                    or(
+                        like(cards.content, `%${q}%`),
+                        like(cards.description, `%${q}%`),
+                        like(labels.title, `%${q}%`)
+                    )
+                );
+            }
+
+            if (dueSoon) {
+                const soonThreshold = new Date();
+                soonThreshold.setDate(soonThreshold.getDate() + 7); // Due within the next 7 days or overdue
+                
+                conditions.push(
+                    and(
+                        eq(cards.completed, false),
+                        sql`${cards.dueDate} IS NOT NULL`,
+                        sql`${cards.dueDate} <= ${soonThreshold.getTime()}`
+                    )
+                );
+            }
+
+            // 6. Execute search
+            const rawCards = await db.select({
+                id: cards.id,
+                content: cards.content,
+                description: cards.description,
+                dueDate: cards.dueDate,
+                dueDateMode: cards.dueDateMode,
+                imageUrl: cards.imageUrl,
+                location: cards.location,
+                locationLat: cards.locationLat,
+                locationLng: cards.locationLng,
+                listId: cards.listId,
+                position: cards.position,
+                completed: cards.completed,
+                createdAt: cards.createdAt
+            })
+                .from(cards)
+                .leftJoin(cardLabels, eq(cardLabels.cardId, cards.id))
+                .leftJoin(labels, eq(labels.id, cardLabels.labelId))
+                .where(and(...conditions))
+                .groupBy(cards.id);
+
+            // Fetch labels for the matching cards
+            const cardIds = rawCards.map(c => c.id);
+            const allCardLabels = cardIds.length > 0 ? await db.select({
+                cardId: cardLabels.cardId,
+                labelId: labels.id,
+                title: labels.title,
+                color: labels.color
+            }).from(cardLabels)
+              .innerJoin(labels, eq(labels.id, cardLabels.labelId))
+              .where(inArray(cardLabels.cardId, cardIds)) : [];
+
+            return rawCards.map(card => ({
+                ...card,
+                labels: allCardLabels.filter(cl => cl.cardId === card.id).map(cl => ({
+                    id: cl.labelId,
+                    title: cl.title,
+                    color: cl.color
+                }))
+            }));
+        }, {
+            query: t.Object({
+                q: t.Optional(t.String()),
+                dueSoon: t.Optional(t.String())
+            })
+        })
+        
         .post('/', async ({ body, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, body.listId)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
@@ -911,6 +1054,51 @@ app
 
             await db.delete(cards).where(eq(cards.id, params.id));
             broadcastUpdate(list.boardId);
+            return { success: true };
+        })
+
+        .post('/:id/labels', async ({ params, body, user, set }) => {
+            const card = await db.select().from(cards).where(eq(cards.id, params.id)).get();
+            if (!card) { set.status = 404; return { error: 'Card not found' }; }
+            
+            const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
+            const board = await db.select().from(boards).where(eq(boards.id, list?.boardId!)).get();
+            
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, board!.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+            if (role === 'viewer' || (!role && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const existing = await db.select().from(cardLabels).where(and(eq(cardLabels.cardId, params.id), eq(cardLabels.labelId, body.labelId))).get();
+            if (!existing) {
+                await db.insert(cardLabels).values({ cardId: params.id, labelId: body.labelId });
+                broadcastUpdate(board!.id);
+            }
+            return { success: true };
+        }, {
+            body: t.Object({ labelId: t.String() })
+        })
+
+        .delete('/:id/labels/:labelId', async ({ params, user, set }) => {
+            const card = await db.select().from(cards).where(eq(cards.id, params.id)).get();
+            if (!card) { set.status = 404; return { error: 'Card not found' }; }
+            
+            const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
+            const board = await db.select().from(boards).where(eq(boards.id, list?.boardId!)).get();
+            
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, board!.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+            if (role === 'viewer' || (!role && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden' }; }
+
+            await db.delete(cardLabels).where(and(eq(cardLabels.cardId, params.id), eq(cardLabels.labelId, params.labelId)));
+            broadcastUpdate(board!.id);
             return { success: true };
         })
     )
@@ -1213,6 +1401,43 @@ app
             broadcastUserUpdate(params.id);
             return { success: true };
         })
+        )
+
+        // --- LABELS ---
+        .group('/labels', (app) => app
+            .patch('/:id', async ({ params, body, user, set }) => {
+                const label = await db.select().from(labels).where(eq(labels.id, params.id)).get();
+                if (!label) { set.status = 404; return { error: 'Label not found' }; }
+                if (!label.projectId && !user!.isAdmin) { set.status = 403; return { error: 'Cannot modify global labels' }; }
+                
+                if (label.projectId) {
+                    const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, label.projectId), eq(projectMembers.userId, user!.id))).get();
+                    const project = await db.select().from(projects).where(eq(projects.id, label.projectId)).get();
+                    if (!projectMember && project?.ownerId !== user!.id && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+                }
+
+                await db.update(labels).set(body as any).where(eq(labels.id, params.id));
+                if (label.projectId) broadcastProjectUpdate(label.projectId);
+                return { success: true };
+            }, {
+                body: t.Object({ title: t.Optional(t.String()), color: t.Optional(t.String()) })
+            })
+
+            .delete('/:id', async ({ params, user, set }) => {
+                const label = await db.select().from(labels).where(eq(labels.id, params.id)).get();
+                if (!label) { set.status = 404; return { error: 'Label not found' }; }
+                if (!label.projectId && !user!.isAdmin) { set.status = 403; return { error: 'Cannot delete global labels' }; }
+                
+                if (label.projectId) {
+                    const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, label.projectId), eq(projectMembers.userId, user!.id))).get();
+                    const project = await db.select().from(projects).where(eq(projects.id, label.projectId)).get();
+                    if (!projectMember && project?.ownerId !== user!.id && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
+                }
+
+                await db.delete(labels).where(eq(labels.id, params.id));
+                if (label.projectId) broadcastProjectUpdate(label.projectId);
+                return { success: true };
+            })
         )
 
         // --- IMAGES ---
