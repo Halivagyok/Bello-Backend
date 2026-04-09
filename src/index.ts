@@ -11,6 +11,9 @@ import { eq, asc, and, desc, sql, inArray, like, or, isNull } from 'drizzle-orm'
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
+const isProd = process.env.NODE_ENV === 'production';
+const cookieConfig = isProd ? 'SameSite=None; Secure' : 'SameSite=Lax';
+
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
 const db = drizzle(client);
@@ -136,7 +139,7 @@ app
             };
             await db.insert(sessions).values(session);
 
-            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${60 * 60 * 24 * 7}`;
+            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
             // 4. Return new user
             return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
             }, {
@@ -172,7 +175,7 @@ app
             };
             await db.insert(sessions).values(session);
 
-            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${60 * 60 * 24 * 7}`;
+            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
             return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         }, {
             body: t.Object({
@@ -186,7 +189,7 @@ app
             if (sessionId && typeof sessionId === 'string') {
                 await db.delete(sessions).where(eq(sessions.id, sessionId));
             }
-            set.headers['Set-Cookie'] = `session_id=; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=0`;
+            set.headers['Set-Cookie'] = `session_id=; Path=/; HttpOnly; ${cookieConfig}; Max-Age=0`;
             return { success: true };
         })
 
