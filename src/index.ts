@@ -136,7 +136,7 @@ app
             };
             await db.insert(sessions).values(session);
 
-            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
+            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${60 * 60 * 24 * 7}`;
             // 4. Return new user
             return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
             }, {
@@ -172,7 +172,7 @@ app
             };
             await db.insert(sessions).values(session);
 
-            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 7}`;
+            set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${60 * 60 * 24 * 7}`;
             return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
         }, {
             body: t.Object({
@@ -186,7 +186,7 @@ app
             if (sessionId && typeof sessionId === 'string') {
                 await db.delete(sessions).where(eq(sessions.id, sessionId));
             }
-            set.headers['Set-Cookie'] = `session_id=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+            set.headers['Set-Cookie'] = `session_id=; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=0`;
             return { success: true };
         })
 
