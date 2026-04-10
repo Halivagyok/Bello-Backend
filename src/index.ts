@@ -253,15 +253,40 @@ app
     )
 
     // --- PROTECTED ROUTES ---
-    .derive(async ({ cookie, set }) => {
+    .derive(async ({ cookie, set, request, path }) => {
         const sessionId = cookie.session_id?.value;
-        if (!sessionId || typeof sessionId !== 'string') return { user: null };
+
+        // Skip debug logging for common non-auth routes if preferred, or just log everything
+        if (!path.startsWith('/uploads') && !path.startsWith('/ws')) {
+            console.log(`\n[DEBUG] ---------------------------`);
+            console.log(`[DEBUG] Incoming Request: ${request.method} ${path}`);
+            console.log(`[DEBUG] Request Origin: ${request.headers.get('origin')}`);
+            console.log(`[DEBUG] Supplied Cookies:`, Object.keys(cookie));
+        }
+
+        if (!sessionId || typeof sessionId !== 'string') {
+            if (!path.startsWith('/uploads') && !path.startsWith('/ws')) console.log(`[DEBUG] Auth Failed: No valid session_id cookie provided.`);
+            return { user: null };
+        }
 
         const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
-        if (!session || session.expiresAt < new Date()) return { user: null };
+        if (!session) {
+            console.log(`[DEBUG] Auth Failed: Session ID invalid or missing in DB.`);
+            return { user: null };
+        }
+        
+        if (session.expiresAt < new Date()) {
+            console.log(`[DEBUG] Auth Failed: Session has expired.`);
+            return { user: null };
+        }
 
         const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
-        if (user?.isBanned) return { user: null };
+        if (user?.isBanned) {
+            console.log(`[DEBUG] Auth Failed: User is banned.`);
+            return { user: null };
+        }
+        
+        if (!path.startsWith('/uploads') && !path.startsWith('/ws')) console.log(`[DEBUG] Auth Success: Authorized as ${user?.email}`);
         return { user };
     })
     .onBeforeHandle(({ path, request, user, set }) => {
@@ -273,6 +298,7 @@ app
             return;
         }
         if (!user) {
+            console.log(`[DEBUG] Returning 401 Unauthorized for protected route: ${path}`);
             set.status = 401;
             return { error: 'Unauthorized' };
         }
