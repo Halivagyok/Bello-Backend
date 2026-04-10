@@ -1400,7 +1400,7 @@ app
                 const projectCountMap = new Map(projectCounts.map(p => [p.userId, p.count]));
                 const boardCountMap = new Map(boardCounts.map(b => [b.userId, b.count]));
 
-                return allUsers.map(u => ({
+                const mappedUsers = allUsers.map(u => ({
                     id: u.id,
                     name: u.name,
                     email: u.email,
@@ -1410,6 +1410,24 @@ app
                     projectsCount: projectCountMap.get(u.id) || 0,
                     boardsCount: boardCountMap.get(u.id) || 0
                 }));
+
+                const totalProjectsQuery = await db.select({ count: sql<number>`count(*)` }).from(projects).get();
+                const totalBoardsQuery = await db.select({ count: sql<number>`count(*)` }).from(boards).get();
+
+                const sevenDaysAgo = new Date();
+                sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+                const recentSignups = allUsers.filter(u => u.createdAt >= sevenDaysAgo).length;
+
+                return { 
+                    users: mappedUsers,
+                    stats: {
+                        totalUsers: allUsers.length,
+                        totalProjects: totalProjectsQuery?.count || 0,
+                        totalBoards: totalBoardsQuery?.count || 0,
+                        totalBanned: allUsers.filter(u => u.isBanned).length,
+                        recentSignups
+                    }
+                };
             } catch (e) {
                 console.error(e);
                 set.status = 500;
