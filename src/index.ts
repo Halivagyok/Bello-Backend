@@ -6,8 +6,8 @@ import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels } from './db/schema';
-import { eq, asc, and, desc, sql, inArray, like, or, isNull } from 'drizzle-orm';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels, personalTasks, personalTaskCompletions } from './db/schema';
+import { eq, asc, and, desc, sql, inArray, like, or, isNull, gte, lte } from 'drizzle-orm';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -915,8 +915,11 @@ app
         .get('/search', async ({ query, user, set }) => {
             const q = query.q?.trim().toLowerCase() || '';
             const dueSoon = query.dueSoon === 'true';
+            const searchDate = query.date; // YYYY-MM-DD
 
-            if (!q && !dueSoon) return [];
+            console.log(`[Search] q: "${q}", dueSoon: ${dueSoon}, date: ${searchDate}`);
+
+            if (!q && !dueSoon && !searchDate) return [];
 
             // 1. Get member boards
             const memberBoards = await db.select({ boardId: boardMembers.boardId }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
@@ -966,6 +969,30 @@ app
                 );
             }
 
+            if (searchDate) {
+                const startOfDay = new Date(searchDate);
+                startOfDay.setHours(0, 0, 0, 0);
+                const endOfDay = new Date(searchDate);
+                endOfDay.setHours(23, 59, 59, 999);
+
+                const startS = Math.floor(startOfDay.getTime() / 1000);
+                const endS = Math.floor(endOfDay.getTime() / 1000);
+                const startMS = startOfDay.getTime();
+                const endMS = endOfDay.getTime();
+
+                conditions.push(
+                    and(
+                        sql`${cards.dueDate} IS NOT NULL`,
+                        or(
+                            // Match seconds (SQLite standard for some tools)
+                            and(gte(cards.dueDate, sql`${startS}`), lte(cards.dueDate, sql`${endS}`)),
+                            // Match milliseconds (JS standard)
+                            and(gte(cards.dueDate, sql`${startMS}`), lte(cards.dueDate, sql`${endMS}`))
+                        )
+                    )
+                );
+            }
+
             // 6. Execute search
             const rawCards = await db.select({
                 id: cards.id,
@@ -978,11 +1005,13 @@ app
                 locationLat: cards.locationLat,
                 locationLng: cards.locationLng,
                 listId: cards.listId,
+                boardId: lists.boardId,
                 position: cards.position,
                 completed: cards.completed,
                 createdAt: cards.createdAt
             })
                 .from(cards)
+                .innerJoin(lists, eq(cards.listId, lists.id))
                 .leftJoin(cardLabels, eq(cardLabels.cardId, cards.id))
                 .leftJoin(labels, eq(labels.id, cardLabels.labelId))
                 .where(and(...conditions))
@@ -1010,7 +1039,8 @@ app
         }, {
             query: t.Object({
                 q: t.Optional(t.String()),
-                dueSoon: t.Optional(t.String())
+                dueSoon: t.Optional(t.String()),
+                date: t.Optional(t.String())
             })
         })
         
@@ -1181,6 +1211,126 @@ app
             await db.delete(cardLabels).where(and(eq(cardLabels.cardId, params.id), eq(cardLabels.labelId, params.labelId)));
             broadcastUpdate(board!.id);
             return { success: true };
+        })
+    )
+
+    // --- PERSONAL TASKS ---
+    .group('/personal-tasks', (app) => app
+        .get('/', async ({ user, query }) => {
+            const date = query.date || new Date().toISOString().split('T')[0];
+            const dayOfWeek = new Date(date).getDay();
+
+            const tasks = await db.select().from(personalTasks).where(
+                and(
+                    eq(personalTasks.userId, user!.id),
+                    or(
+                        eq(personalTasks.date, date), // One-time task for this date
+                        like(personalTasks.daysOfWeek, `%${dayOfWeek}%`), // Repeating task for this day
+                        isNull(personalTasks.daysOfWeek) // Also include tasks with no repeat AND matching date if any (redundant with eq(date) but safe)
+                    )
+                )
+            );
+            
+            // Further filter daysOfWeek precisely (since like %1% matches 11, although we only have 0-6)
+            const filteredTasks = tasks.filter(t => {
+                if (t.date === date) return true;
+                if (t.daysOfWeek) {
+                    const days = t.daysOfWeek.split(',');
+                    return days.includes(dayOfWeek.toString());
+                }
+                return false;
+            });
+
+            // Get completions for the specified date
+            const completions = await db.select().from(personalTaskCompletions)
+                .where(and(
+                    inArray(personalTaskCompletions.taskId, filteredTasks.length > 0 ? filteredTasks.map(t => t.id) : ['none']),
+                    eq(personalTaskCompletions.completedDate, date)
+                ));
+            
+            const completionMap = new Set(completions.map(c => c.taskId));
+
+            return filteredTasks.map(t => ({
+                ...t,
+                completed: completionMap.has(t.id)
+            }));
+        }, {
+            query: t.Object({
+                date: t.Optional(t.String())
+            })
+        })
+        .post('/', async ({ body, user }) => {
+            const newTask = {
+                id: crypto.randomUUID(),
+                userId: user!.id,
+                title: body.title,
+                description: body.description || null,
+                dueTime: body.dueTime || null,
+                daysOfWeek: body.daysOfWeek || null,
+                date: body.date || null,
+                location: body.location || null,
+                imageUrl: body.imageUrl || null,
+                createdAt: new Date()
+            };
+            await db.insert(personalTasks).values(newTask);
+            return newTask;
+        }, {
+            body: t.Object({
+                title: t.String(),
+                description: t.Optional(t.Nullable(t.String())),
+                dueTime: t.Optional(t.Nullable(t.String())),
+                daysOfWeek: t.Optional(t.Nullable(t.String())),
+                date: t.Optional(t.Nullable(t.String())),
+                location: t.Optional(t.Nullable(t.String())),
+                imageUrl: t.Optional(t.Nullable(t.String()))
+            })
+        })
+        .patch('/:id', async ({ params, body, user, set }) => {
+            const task = await db.select().from(personalTasks).where(and(eq(personalTasks.id, params.id), eq(personalTasks.userId, user!.id))).get();
+            if (!task) { set.status = 404; return { error: 'Task not found' }; }
+            await db.update(personalTasks).set(body as any).where(eq(personalTasks.id, params.id));
+            return { success: true };
+        }, {
+            body: t.Object({
+                title: t.Optional(t.String()),
+                description: t.Optional(t.Nullable(t.String())),
+                dueTime: t.Optional(t.Nullable(t.String())),
+                daysOfWeek: t.Optional(t.Nullable(t.String())),
+                date: t.Optional(t.Nullable(t.String())),
+                location: t.Optional(t.Nullable(t.String())),
+                imageUrl: t.Optional(t.Nullable(t.String()))
+            })
+        })
+        .delete('/:id', async ({ params, user, set }) => {
+            const task = await db.select().from(personalTasks).where(and(eq(personalTasks.id, params.id), eq(personalTasks.userId, user!.id))).get();
+            if (!task) { set.status = 404; return { error: 'Task not found' }; }
+            await db.delete(personalTasks).where(eq(personalTasks.id, params.id));
+            return { success: true };
+        })
+        .post('/:id/toggle', async ({ params, body, user, set }) => {
+            const task = await db.select().from(personalTasks).where(and(eq(personalTasks.id, params.id), eq(personalTasks.userId, user!.id))).get();
+            if (!task) { set.status = 404; return { error: 'Task not found' }; }
+            
+            const date = body.date || new Date().toISOString().split('T')[0];
+            const existing = await db.select().from(personalTaskCompletions)
+                .where(and(eq(personalTaskCompletions.taskId, params.id), eq(personalTaskCompletions.completedDate, date))).get();
+            
+            if (existing) {
+                await db.delete(personalTaskCompletions).where(eq(personalTaskCompletions.id, existing.id));
+                return { completed: false };
+            } else {
+                await db.insert(personalTaskCompletions).values({
+                    id: crypto.randomUUID(),
+                    taskId: params.id,
+                    completedDate: date,
+                    createdAt: new Date()
+                });
+                return { completed: true };
+            }
+        }, {
+            body: t.Object({
+                date: t.Optional(t.String())
+            })
         })
     )
 

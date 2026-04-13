@@ -95,3 +95,23 @@ export const cardLabels = sqliteTable("card_labels", {
     cardId: text("card_id").notNull().references(() => cards.id, { onDelete: 'cascade' }),
     labelId: text("label_id").notNull().references(() => labels.id, { onDelete: 'cascade' }),
 });
+
+export const personalTasks = sqliteTable("personal_tasks", {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    title: text("title").notNull(),
+    description: text("description"),
+    dueTime: text("due_time"), // "HH:mm"
+    daysOfWeek: text("days_of_week"), // Comma-separated days: "0,1,2,3,4,5,6" (0 is Sunday)
+    date: text("date"), // "YYYY-MM-DD" for one-time tasks
+    location: text("location"),
+    imageUrl: text("image_url"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
+
+export const personalTaskCompletions = sqliteTable("personal_task_completions", {
+    id: text("id").primaryKey(),
+    taskId: text("task_id").notNull().references(() => personalTasks.id, { onDelete: 'cascade' }),
+    completedDate: text("completed_date").notNull(), // "YYYY-MM-DD"
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
