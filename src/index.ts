@@ -115,6 +115,12 @@ app
     // --- AUTHENTICATION ---
     .group('/auth', (app) => app
         .post('/signup', async ({ body, set }) => {
+            const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+            if (!passwordRegex.test(body.password)) {
+                set.status = 400;
+                return { error: 'Password must be at least 8 characters long, with an uppercase, lowercase, and number.' };
+            }
+
             const existing = await db.select().from(users).where(eq(users.email, body.email)).get();
             if (existing) {
                 set.status = 400;
@@ -234,6 +240,12 @@ app
 
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
+
+            const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+            if (!passwordRegex.test(body.newPassword)) {
+                set.status = 400;
+                return { error: 'New password must be at least 8 characters long, with an uppercase, lowercase, and number.' };
+            }
 
             // Verify current password
             const isMatch = await Bun.password.verify(body.currentPassword, user.password);
