@@ -1488,6 +1488,17 @@ app
             return { success: true, isBanned: !user.isBanned };
         })
 
+        .post('/users/:id/admin', async ({ params, body, set, user: adminUser }) => {
+            const target = await db.select().from(users).where(eq(users.id, params.id)).get();
+            if (!target) { set.status = 404; return { error: 'User not found' }; }
+            if (params.id === adminUser!.id) { set.status = 400; return { error: 'Cannot change your own admin status' }; }
+            await db.update(users).set({ isAdmin: body.isAdmin }).where(eq(users.id, params.id));
+            broadcastUserUpdate(params.id);
+            return { success: true, isAdmin: body.isAdmin };
+        }, {
+            body: t.Object({ isAdmin: t.Boolean() })
+        })
+
         .patch('/users/:id/name', async ({ params, body, set }) => {
             const user = await db.select().from(users).where(eq(users.id, params.id)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
