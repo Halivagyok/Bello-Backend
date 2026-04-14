@@ -182,7 +182,7 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
+            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin } };
         }, {
             body: t.Object({
                 email: t.String(),
