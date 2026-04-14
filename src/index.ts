@@ -115,6 +115,12 @@ app
     // --- AUTHENTICATION ---
     .group('/auth', (app) => app
         .post('/signup', async ({ body, set }) => {
+            const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+            if (!passwordRegex.test(body.password)) {
+                set.status = 400;
+                return { error: 'Password must be at least 8 characters long, with an uppercase, lowercase, and number.' };
+            }
+
             const existing = await db.select().from(users).where(eq(users.email, body.email)).get();
             if (existing) {
                 set.status = 400;
@@ -176,7 +182,7 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name, isAdmin: user.isAdmin } };
+            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin } };
         }, {
             body: t.Object({
                 email: t.String(),
@@ -234,6 +240,12 @@ app
 
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
             if (!user) { set.status = 404; return { error: 'User not found' }; }
+
+            const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+            if (!passwordRegex.test(body.newPassword)) {
+                set.status = 400;
+                return { error: 'New password must be at least 8 characters long, with an uppercase, lowercase, and number.' };
+            }
 
             // Verify current password
             const isMatch = await Bun.password.verify(body.currentPassword, user.password);
@@ -1624,6 +1636,17 @@ app
             await db.update(users).set({ isBanned: !user.isBanned }).where(eq(users.id, params.id));
             broadcastUserUpdate(params.id);
             return { success: true, isBanned: !user.isBanned };
+        })
+
+        .post('/users/:id/admin', async ({ params, body, set, user: adminUser }) => {
+            const target = await db.select().from(users).where(eq(users.id, params.id)).get();
+            if (!target) { set.status = 404; return { error: 'User not found' }; }
+            if (params.id === adminUser!.id) { set.status = 400; return { error: 'Cannot change your own admin status' }; }
+            await db.update(users).set({ isAdmin: body.isAdmin }).where(eq(users.id, params.id));
+            broadcastUserUpdate(params.id);
+            return { success: true, isAdmin: body.isAdmin };
+        }, {
+            body: t.Object({ isAdmin: t.Boolean() })
         })
 
         .patch('/users/:id/name', async ({ params, body, set }) => {
