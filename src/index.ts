@@ -6,7 +6,7 @@ import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels, personalTasks, personalTaskCompletions } from './db/schema';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels, cardMembers, personalTasks, personalTaskCompletions } from './db/schema';
 import { eq, asc, and, desc, sql, inArray, like, or, isNull, gte, lte } from 'drizzle-orm';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -399,6 +399,76 @@ app
             return { ...project, members };
         })
 
+        .get('/:id/cards', async ({ params, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            const isMember = await db.select().from(projectMembers)
+                .where(and(eq(projectMembers.projectId, params.id), eq(projectMembers.userId, user!.id))).get();
+
+            if (project.ownerId !== user!.id && !isMember && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden' };
+            }
+
+            const projectBoards = await db.select({ id: boards.id }).from(boards).where(eq(boards.projectId, params.id));
+            const boardIds = projectBoards.map(b => b.id);
+            if (boardIds.length === 0) return [];
+
+            const projectLists = await db.select({ id: lists.id }).from(lists).where(inArray(lists.boardId, boardIds));
+            const listIds = projectLists.map(l => l.id);
+            if (listIds.length === 0) return [];
+
+            const allCards = await db.select({
+                id: cards.id,
+                content: cards.content,
+                description: cards.description,
+                dueDate: cards.dueDate,
+                dueDateMode: cards.dueDateMode,
+                imageUrl: cards.imageUrl,
+                location: cards.location,
+                locationLat: cards.locationLat,
+                locationLng: cards.locationLng,
+                listId: cards.listId,
+                boardId: lists.boardId,
+                position: cards.position,
+                completed: cards.completed,
+                createdAt: cards.createdAt
+            })
+                .from(cards)
+                .innerJoin(lists, eq(cards.listId, lists.id))
+                .where(inArray(cards.listId, listIds));
+
+            const cardIds = allCards.map(c => c.id);
+            const allCardLabels = cardIds.length > 0 ? await db.select({
+                cardId: cardLabels.cardId,
+                labelId: labels.id,
+                title: labels.title,
+                color: labels.color
+            }).from(cardLabels)
+              .innerJoin(labels, eq(labels.id, cardLabels.labelId))
+              .where(inArray(cardLabels.cardId, cardIds)) : [];
+
+            const allCardMembers = cardIds.length > 0 ? await db.select({
+                cardId: cardMembers.cardId,
+                id: users.id,
+                name: users.name,
+                email: users.email,
+                avatarUrl: users.avatarUrl
+            }).from(cardMembers)
+              .innerJoin(users, eq(users.id, cardMembers.userId))
+              .where(inArray(cardMembers.cardId, cardIds)) : [];
+
+            return allCards.map(card => ({
+                ...card,
+                labels: allCardLabels.filter(cl => cl.cardId === card.id).map(cl => ({
+                    id: cl.labelId,
+                    title: cl.title,
+                    color: cl.color
+                })),
+                members: allCardMembers.filter(cm => cm.cardId === card.id)
+            }));
+        })
+
         .patch('/:id', async ({ params, body, user, set }) => {
             const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
             if (!project) { set.status = 404; return { error: 'Project not found' }; }
@@ -741,6 +811,16 @@ app
               .innerJoin(labels, eq(labels.id, cardLabels.labelId))
               .where(inArray(cardLabels.cardId, cardIds)) : [];
 
+            const allCardMembers = cardIds.length > 0 ? await db.select({
+                cardId: cardMembers.cardId,
+                id: users.id,
+                name: users.name,
+                email: users.email,
+                avatarUrl: users.avatarUrl
+            }).from(cardMembers)
+              .innerJoin(users, eq(users.id, cardMembers.userId))
+              .where(inArray(cardMembers.cardId, cardIds)) : [];
+
             return {
                 ...board,
                 role,
@@ -753,7 +833,8 @@ app
                             id: cl.labelId,
                             title: cl.title,
                             color: cl.color
-                        }))
+                        })),
+                        members: allCardMembers.filter(cm => cm.cardId === card.id)
                     }))
                 }))
             };
@@ -1221,6 +1302,51 @@ app
             if (role === 'viewer' || (!role && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden' }; }
 
             await db.delete(cardLabels).where(and(eq(cardLabels.cardId, params.id), eq(cardLabels.labelId, params.labelId)));
+            broadcastUpdate(board!.id);
+            return { success: true };
+        })
+
+        .post('/:id/members', async ({ params, body, user, set }) => {
+            const card = await db.select().from(cards).where(eq(cards.id, params.id)).get();
+            if (!card) { set.status = 404; return { error: 'Card not found' }; }
+            
+            const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
+            const board = await db.select().from(boards).where(eq(boards.id, list?.boardId!)).get();
+            
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, board!.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+            if (role === 'viewer' || (!role && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden' }; }
+
+            const existing = await db.select().from(cardMembers).where(and(eq(cardMembers.cardId, params.id), eq(cardMembers.userId, body.userId))).get();
+            if (!existing) {
+                await db.insert(cardMembers).values({ cardId: params.id, userId: body.userId });
+                broadcastUpdate(board!.id);
+            }
+            return { success: true };
+        }, {
+            body: t.Object({ userId: t.String() })
+        })
+
+        .delete('/:id/members/:userId', async ({ params, user, set }) => {
+            const card = await db.select().from(cards).where(eq(cards.id, params.id)).get();
+            if (!card) { set.status = 404; return { error: 'Card not found' }; }
+            
+            const list = await db.select().from(lists).where(eq(lists.id, card.listId)).get();
+            const board = await db.select().from(boards).where(eq(boards.id, list?.boardId!)).get();
+            
+            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, board!.id), eq(boardMembers.userId, user!.id))).get();
+            let role = directMember?.role;
+            if (!role && board?.projectId) {
+                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
+                role = projectMember?.role;
+            }
+            if (role === 'viewer' || (!role && !user!.isAdmin)) { set.status = 403; return { error: 'Forbidden' }; }
+
+            await db.delete(cardMembers).where(and(eq(cardMembers.cardId, params.id), eq(cardMembers.userId, params.userId)));
             broadcastUpdate(board!.id);
             return { success: true };
         })

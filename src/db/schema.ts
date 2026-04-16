@@ -96,6 +96,11 @@ export const cardLabels = sqliteTable("card_labels", {
     labelId: text("label_id").notNull().references(() => labels.id, { onDelete: 'cascade' }),
 });
 
+export const cardMembers = sqliteTable("card_members", {
+    cardId: text("card_id").notNull().references(() => cards.id, { onDelete: 'cascade' }),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+});
+
 export const personalTasks = sqliteTable("personal_tasks", {
     id: text("id").primaryKey(),
     userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
