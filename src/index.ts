@@ -1642,32 +1642,6 @@ app
             })
         })
 
-        .patch('/:id/owner', async ({ params, body, user, set }) => {
-            const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
-            if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
-            const board = await db.select().from(boards).where(eq(boards.id, list.boardId)).get();
-
-            const directMember = await db.select().from(boardMembers).where(and(eq(boardMembers.boardId, list.boardId), eq(boardMembers.userId, user!.id))).get();
-            let role = directMember?.role;
-            if (!role && board?.projectId) {
-                const projectMember = await db.select().from(projectMembers).where(and(eq(projectMembers.projectId, board.projectId), eq(projectMembers.userId, user!.id))).get();
-                role = projectMember?.role;
-            }
-
-            const isBoardOwner = board?.ownerId === user!.id;
-            const isBoardAdmin = (rolePriority[role!] || 0) >= 3;
-
-            if (!isBoardOwner && !isBoardAdmin && !user!.isAdmin) {
-                set.status = 403; return { error: 'Forbidden: Only board admins or higher can transfer list ownership' };
-            }
-
-            await db.update(lists).set({ ownerId: body.ownerId }).where(eq(lists.id, params.id));
-            broadcastUpdate(list.boardId);
-            return { success: true };
-        }, {
-            body: t.Object({ ownerId: t.String() })
-        })
-
         .delete('/:id', async ({ params, user, set }) => {
             const list = await db.select().from(lists).where(eq(lists.id, params.id)).get();
             if (!list || !list.boardId) { set.status = 404; return { error: 'List not found' }; }
