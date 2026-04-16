@@ -47,7 +47,7 @@ if (!existsSync(UPLOADS_DIR)) {
 const rolePriority: Record<string, number> = { 'owner': 4, 'admin': 3, 'member': 2, 'viewer': 1 };
 
 // 2. Initialize App
-const app = new Elysia()
+export const app = new Elysia()
     .use(cors({
         origin: true, // Mirror the requester's origin for development
         credentials: true,
@@ -1952,8 +1952,11 @@ app
         })
         )
 
-        .get('/api/ping', () => ({ message: "Backend Connected! 🚀" }))
-    .listen(3000);
+        .get('/api/ping', () => ({ message: "Backend Connected! 🚀" }));
 
 export type App = typeof app;
-console.log(`🦊 Backend running at http://localhost:3000`);
+
+if (process.env.NODE_ENV !== 'test') {
+    app.listen(3000);
+    console.log(`🦊 Backend running at http://localhost:3000`);
+}
