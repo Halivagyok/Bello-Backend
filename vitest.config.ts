@@ -5,5 +5,6 @@ export default defineConfig({
         globals: true,
         setupFiles: ['./test/setup.ts'],
         environment: 'node',
+        reporters: ['verbose'],
     }
 });

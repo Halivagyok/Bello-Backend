@@ -25,23 +25,33 @@ describe('Project Endpoints', () => {
         dbMock.get.mockResolvedValueOnce({ id: 'session1', userId: 'user1', expiresAt: new Date(Date.now() + 100000) });
         dbMock.get.mockResolvedValueOnce({ id: 'user1', email: 'test@t.com', isBanned: false });
         
-        // Mock project members
-        dbMock.where.mockReturnValue(dbMock);
-        // It returns an array of member projects, then all projects
-        dbMock.select.mockReturnValueOnce(dbMock); // For memberProjects
-        dbMock.from.mockReturnValueOnce(dbMock); // From projectMembers
-        // Mock resolved values for the query execution
-        // We know we did select().from().where() without get() meaning it awaits the array
-        const memberProjectsPromise = Promise.resolve([{ projectId: 'proj1' }]);
-        (memberProjectsPromise as any).where = dbMock.where;
-        dbMock.where.mockResolvedValueOnce([{ projectId: 'proj1' }]);
+        // Auth Middleware expects .get() to exist on the object returned by where()
+        let whereCount = 0;
+        dbMock.where.mockImplementation(() => {
+            whereCount++;
+            if (whereCount === 3) {
+                // Third query is memberProjects, which awaits directly (no .get())
+                return Promise.resolve([{ projectId: 'proj1' }]);
+            }
+            return dbMock;
+        });
         
-        dbMock.select.mockReturnValueOnce(dbMock); // For allProjects
-        dbMock.from.mockResolvedValueOnce([
-            { id: 'proj1', ownerId: 'other' },
-            { id: 'proj2', ownerId: 'user1' },
-            { id: 'proj3', ownerId: 'someone_else' }
-        ]);
+        dbMock.select.mockReturnValue(dbMock);
+        dbMock.from.mockImplementation(() => {
+            if (whereCount === 3) {
+                // Fourth query is allProjects, which also awaits directly without where.
+                // But wait, the 4th query doesn't use where(), so from() needs to resolve.
+                let calls = dbMock.from.mock.calls.length;
+                if (calls === 4) {
+                    return Promise.resolve([
+                        { id: 'proj1', ownerId: 'other' },
+                        { id: 'proj2', ownerId: 'user1' },
+                        { id: 'proj3', ownerId: 'someone_else' }
+                    ]);
+                }
+            }
+            return dbMock;
+        });
 
         const req = new Request('http://localhost/projects/', {
             method: 'GET',
@@ -51,6 +61,9 @@ describe('Project Endpoints', () => {
         });
 
         const res = await app.handle(req);
+        if (res.status !== 200) {
+            console.error(await res.text());
+        }
         expect(res.status).toBe(200);
         const projects = await res.json();
         // Should only see proj1 (member) and proj2 (owner)
