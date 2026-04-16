@@ -6,8 +6,9 @@ import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { drizzle } from 'drizzle-orm/libsql';
 import { createClient } from '@libsql/client';
-import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels, cardMembers, personalTasks, personalTaskCompletions } from './db/schema';
+import { lists, cards, users, sessions, boards, boardMembers, projects, projectMembers, images, labels, cardLabels, cardMembers, personalTasks, personalTaskCompletions, passwordResetTokens, emailStats } from './db/schema';
 import { eq, asc, and, desc, sql, inArray, like, or, isNull, gte, lte } from 'drizzle-orm';
+import { sendWelcomeEmail, sendResetPasswordEmail, sendInviteEmail } from './services/email';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -146,6 +147,15 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
+            
+            // Send Welcome Email
+            await sendWelcomeEmail(user.email, user.name || 'there');
+            await db.insert(emailStats).values({
+                id: crypto.randomUUID(),
+                type: 'signup',
+                recipient: user.email
+            });
+
             // 4. Return new user
             return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
             }, {
@@ -231,6 +241,21 @@ app
             })
         })
 
+        .delete('/me', async ({ cookie, set }) => {
+            const sessionId = cookie.session_id?.value;
+            if (!sessionId || typeof sessionId !== 'string') { set.status = 401; return { error: 'Unauthorized' }; }
+
+            const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+            if (!session) { set.status = 401; return { error: 'Unauthorized' }; }
+
+            // Delete the user - thanks to cascade constraints in schema, associated data goes with it.
+            await db.delete(users).where(eq(users.id, session.userId));
+            
+            // Clear the cookie
+            set.headers['Set-Cookie'] = `session_id=; Path=/; HttpOnly; ${cookieConfig}; Max-Age=0`;
+            return { success: true };
+        })
+
         .patch('/password', async ({ body, cookie, set }) => {
             const sessionId = cookie.session_id?.value;
             if (!sessionId || typeof sessionId !== 'string') { set.status = 401; return { error: 'Unauthorized' }; }
@@ -261,6 +286,62 @@ app
                 currentPassword: t.String(),
                 newPassword: t.String()
             })
+        })
+
+        .post('/forgot-password', async ({ body, set }) => {
+            const user = await db.select().from(users).where(eq(users.email, body.email)).get();
+            if (user) {
+                // Generate secure token
+                const token = crypto.getRandomValues(new Uint8Array(32)).reduce((acc, val) => acc + val.toString(16).padStart(2, '0'), '');
+                
+                await db.insert(passwordResetTokens).values({
+                    id: crypto.randomUUID(),
+                    userId: user.id,
+                    token: token,
+                    expiresAt: new Date(Date.now() + 1000 * 60 * 60) // 1 hour
+                });
+
+                await sendResetPasswordEmail(user.email, user.name || 'there', token);
+                await db.insert(emailStats).values({
+                    id: crypto.randomUUID(),
+                    type: 'reset_password',
+                    recipient: user.email
+                });
+            }
+            // Always return success to prevent email enumeration
+            return { success: true };
+        }, {
+            body: t.Object({ email: t.String() })
+        })
+
+        .post('/reset-password', async ({ body, set }) => {
+            const tokenRecord = await db.select().from(passwordResetTokens).where(eq(passwordResetTokens.token, body.token)).get();
+            if (!tokenRecord) {
+                set.status = 400;
+                return { error: 'Invalid or expired token' };
+            }
+            if (tokenRecord.expiresAt < new Date()) {
+                set.status = 400;
+                return { error: 'Token has expired' };
+            }
+
+            const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+            if (!passwordRegex.test(body.password)) {
+                set.status = 400;
+                return { error: 'Password must be at least 8 characters long, with an uppercase, lowercase, and number.' };
+            }
+
+            const hashedPassword = await Bun.password.hash(body.password);
+            await db.update(users).set({ password: hashedPassword }).where(eq(users.id, tokenRecord.userId));
+            
+            // Invalidate all tokens for this user
+            await db.delete(passwordResetTokens).where(eq(passwordResetTokens.userId, tokenRecord.userId));
+            // Invalidate sessions so they have to login again
+            await db.delete(sessions).where(eq(sessions.userId, tokenRecord.userId));
+
+            return { success: true };
+        }, {
+            body: t.Object({ token: t.String(), password: t.String() })
         })
     )
 
@@ -537,6 +618,14 @@ app
             }
             broadcastProjectUpdate(params.id);
             broadcastUserUpdate(targetUser.id);
+
+            // Send Invite Email
+            await sendInviteEmail(targetUser.email, user!.name || 'Someone', project.title, body.role || 'member', project.id);
+            await db.insert(emailStats).values({
+                id: crypto.randomUUID(),
+                type: 'invite',
+                recipient: targetUser.email
+            });
 
             return { success: true };
         }, {
@@ -1701,6 +1790,7 @@ app
 
                 const totalProjectsQuery = await db.select({ count: sql<number>`count(*)` }).from(projects).get();
                 const totalBoardsQuery = await db.select({ count: sql<number>`count(*)` }).from(boards).get();
+                const totalEmailsQuery = await db.select({ count: sql<number>`count(*)` }).from(emailStats).get();
 
                 const sevenDaysAgo = new Date();
                 sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -1713,7 +1803,8 @@ app
                         totalProjects: totalProjectsQuery?.count || 0,
                         totalBoards: totalBoardsQuery?.count || 0,
                         totalBanned: allUsers.filter(u => u.isBanned).length,
-                        recentSignups
+                        recentSignups,
+                        totalEmails: totalEmailsQuery?.count || 0
                     }
                 };
             } catch (e) {

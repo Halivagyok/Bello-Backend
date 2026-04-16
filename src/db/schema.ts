@@ -11,6 +11,21 @@ export const users = sqliteTable("users", {
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
+export const passwordResetTokens = sqliteTable("password_reset_tokens", {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    token: text("token").notNull(),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
+
+export const emailStats = sqliteTable("email_stats", {
+    id: text("id").primaryKey(),
+    type: text("type").notNull(), // 'signup', 'reset_password', 'invite'
+    recipient: text("recipient").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+});
+
 export const sessions = sqliteTable("sessions", {
     id: text("id").primaryKey(),
     userId: text("user_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
