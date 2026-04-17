@@ -13,7 +13,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
 const isProd = process.env.NODE_ENV === 'production';
-const cookieConfig = isProd ? 'SameSite=None; Secure' : 'SameSite=Lax';
+const cookieConfig = 'SameSite=None; Secure';
 
 // 1. Setup Database
 const client = createClient({ url: 'file:bello.db' });
@@ -49,7 +49,7 @@ const rolePriority: Record<string, number> = { 'owner': 4, 'admin': 3, 'member':
 // 2. Initialize App
 export const app = new Elysia()
     .use(cors({
-        origin: true, // Mirror the requester's origin for development
+        origin: [/localhost:5173$/, /projectbello\.hu$/],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Cookie']
     }))
