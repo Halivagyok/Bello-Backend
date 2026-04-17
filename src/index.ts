@@ -157,7 +157,7 @@ app
             });
 
             // 4. Return new user
-            return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false } };
+            return { user: { id: user.id, email: body.email, name: body.name, avatarUrl: null, isAdmin: false, preferences: null } };
             }, {
             body: t.Object({
                 email: t.String(),
@@ -192,7 +192,7 @@ app
             await db.insert(sessions).values(session);
 
             set.headers['Set-Cookie'] = `session_id=${session.id}; Path=/; HttpOnly; ${cookieConfig}; Max-Age=${60 * 60 * 24 * 7}`;
-            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin } };
+            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin, preferences: user.preferences } };
         }, {
             body: t.Object({
                 email: t.String(),
@@ -220,7 +220,7 @@ app
             if (!user) return { user: null };
             if (user.isBanned) return { user: null };
 
-            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin } };
+            return { user: { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, isAdmin: user.isAdmin, preferences: user.preferences } };
         })
 
         .patch('/me', async ({ body, cookie, set }) => {
@@ -232,12 +232,18 @@ app
 
             await db.update(users).set(body).where(eq(users.id, session.userId));
             const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
-            return { user: { id: user!.id, email: user!.email, name: user!.name, avatarUrl: user!.avatarUrl, isAdmin: user!.isAdmin } };
+            return { user: { id: user!.id, email: user!.email, name: user!.name, avatarUrl: user!.avatarUrl, isAdmin: user!.isAdmin, preferences: user!.preferences } };
         }, {
             body: t.Object({
                 name: t.Optional(t.String()),
                 email: t.Optional(t.String()),
-                avatarUrl: t.Optional(t.Nullable(t.String()))
+                avatarUrl: t.Optional(t.Nullable(t.String())),
+                preferences: t.Optional(t.Object({
+                    showSpecialBackground: t.Optional(t.Boolean()),
+                    specialBackgroundColors: t.Optional(t.Array(t.String())),
+                    specialBackgroundDarkColors: t.Optional(t.Array(t.String())),
+                    hideBoardTasksOnWeekends: t.Optional(t.Boolean())
+                }))
             })
         })
 
@@ -513,6 +519,7 @@ app
                 boardId: lists.boardId,
                 position: cards.position,
                 completed: cards.completed,
+                dueDateSetAt: cards.dueDateSetAt,
                 createdAt: cards.createdAt
             })
                 .from(cards)
@@ -1152,25 +1159,27 @@ app
             }
 
             if (searchDate) {
-                const startOfDay = new Date(searchDate);
-                startOfDay.setHours(0, 0, 0, 0);
-                const endOfDay = new Date(searchDate);
-                endOfDay.setHours(23, 59, 59, 999);
+                const searchDateObj = new Date(searchDate);
+                searchDateObj.setHours(0, 0, 0, 0); // Start of the day we are looking at
+                
+                const searchTimeS = Math.floor(searchDateObj.getTime() / 1000);
+                const searchTimeMS = searchDateObj.getTime();
 
-                const startS = Math.floor(startOfDay.getTime() / 1000);
-                const endS = Math.floor(endOfDay.getTime() / 1000);
-                const startMS = startOfDay.getTime();
-                const endMS = endOfDay.getTime();
+                // Get cards where user is a member
+                const memberCardIds = (await db.select({ cardId: cardMembers.cardId }).from(cardMembers).where(eq(cardMembers.userId, user!.id))).map(c => c.cardId);
 
                 conditions.push(
-                    and(
-                        sql`${cards.dueDate} IS NOT NULL`,
-                        or(
-                            // Match seconds (SQLite standard for some tools)
-                            and(gte(cards.dueDate, sql`${startS}`), lte(cards.dueDate, sql`${endS}`)),
-                            // Match milliseconds (JS standard)
-                            and(gte(cards.dueDate, sql`${startMS}`), lte(cards.dueDate, sql`${endMS}`))
-                        )
+                    or(
+                        // Option A: Has a due date and it's on or after today (frontend filters the range)
+                        and(
+                            sql`${cards.dueDate} IS NOT NULL`,
+                            or(
+                                gte(cards.dueDate, sql`${searchTimeS}`),
+                                gte(cards.dueDate, sql`${searchTimeMS}`)
+                            )
+                        ),
+                        // Option B: User is a member (show on all days in calendar)
+                        memberCardIds.length > 0 ? inArray(cards.id, memberCardIds) : sql`1=0`
                     )
                 );
             }
@@ -1190,6 +1199,7 @@ app
                 boardId: lists.boardId,
                 position: cards.position,
                 completed: cards.completed,
+                dueDateSetAt: cards.dueDateSetAt,
                 createdAt: cards.createdAt
             })
                 .from(cards)
@@ -1199,7 +1209,7 @@ app
                 .where(and(...conditions))
                 .groupBy(cards.id);
 
-            // Fetch labels for the matching cards
+            // Fetch labels and members for the matching cards
             const cardIds = rawCards.map(c => c.id);
             const allCardLabels = cardIds.length > 0 ? await db.select({
                 cardId: cardLabels.cardId,
@@ -1210,12 +1220,28 @@ app
               .innerJoin(labels, eq(labels.id, cardLabels.labelId))
               .where(inArray(cardLabels.cardId, cardIds)) : [];
 
+            const allCardMembers = cardIds.length > 0 ? await db.select({
+                cardId: cardMembers.cardId,
+                userId: users.id,
+                name: users.name,
+                email: users.email,
+                avatarUrl: users.avatarUrl
+            }).from(cardMembers)
+              .innerJoin(users, eq(users.id, cardMembers.userId))
+              .where(inArray(cardMembers.cardId, cardIds)) : [];
+
             return rawCards.map(card => ({
                 ...card,
                 labels: allCardLabels.filter(cl => cl.cardId === card.id).map(cl => ({
                     id: cl.labelId,
                     title: cl.title,
                     color: cl.color
+                })),
+                members: allCardMembers.filter(cm => cm.cardId === card.id).map(cm => ({
+                    id: cm.userId,
+                    name: cm.name,
+                    email: cm.email,
+                    avatarUrl: cm.avatarUrl
                 }))
             }));
         }, {
@@ -1241,11 +1267,14 @@ app
             if (role === 'viewer') { set.status = 403; return { error: 'Viewers cannot add cards' }; }
             if (!role && !user!.isAdmin) { set.status = 403; return { error: 'Forbidden' }; }
 
-            const newCard = {
+            const newCard: any = {
                 id: crypto.randomUUID(),
                 content: body.content,
                 listId: body.listId,
-                position: body.position ?? Date.now()
+                position: body.position ?? Date.now(),
+                dueDate: body.dueDate,
+                dueDateMode: body.dueDateMode,
+                dueDateSetAt: body.dueDate ? new Date() : null
             };
             await db.insert(cards).values(newCard);
             broadcastUpdate(list.boardId);
@@ -1254,7 +1283,9 @@ app
             body: t.Object({
                 content: t.String(),
                 listId: t.String(),
-                position: t.Optional(t.Number())
+                position: t.Optional(t.Number()),
+                dueDate: t.Optional(t.Nullable(t.Date())),
+                dueDateMode: t.Optional(t.Nullable(t.String()))
             })
         })
 
@@ -1308,7 +1339,14 @@ app
                 }
             }
 
-            const [updated] = await db.update(cards).set(body).where(eq(cards.id, params.id)).returning();
+            const updateData: any = { ...body };
+            if (body.dueDate && !card.dueDate) {
+                updateData.dueDateSetAt = new Date();
+            } else if (!body.dueDate && card.dueDate) {
+                updateData.dueDateSetAt = null;
+            }
+
+            const [updated] = await db.update(cards).set(updateData).where(eq(cards.id, params.id)).returning();
             broadcastUpdate(list.boardId);
             return updated;
         }, {

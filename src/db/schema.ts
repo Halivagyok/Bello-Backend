@@ -8,6 +8,12 @@ export const users = sqliteTable("users", {
     avatarUrl: text("avatar_url"),
     isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
     isBanned: integer("is_banned", { mode: "boolean" }).notNull().default(false),
+    preferences: text("preferences", { mode: "json" }).$type<{
+        showSpecialBackground?: boolean;
+        specialBackgroundColors?: [string, string, string];
+        specialBackgroundDarkColors?: [string, string, string];
+        hideBoardTasksOnWeekends?: boolean;
+    }>(),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
@@ -85,6 +91,7 @@ export const cards = sqliteTable("cards", {
     listId: text("list_id").notNull().references(() => lists.id, { onDelete: 'cascade' }),
     position: real("position").notNull().default(0),
     completed: integer("completed", { mode: "boolean" }).notNull().default(false),
+    dueDateSetAt: integer("due_date_set_at", { mode: "timestamp" }),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
