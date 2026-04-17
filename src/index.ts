@@ -82,21 +82,17 @@ app
     // .use(websocket()) // Built-in now
     .ws('/ws', {
         open(ws) {
-            console.log('WS Connected');
         },
         message(ws, rawMessage: any) {
             const message = typeof rawMessage === 'string' ? JSON.parse(rawMessage) : rawMessage;
             if (message.type === 'subscribe' && message.boardId) {
                 ws.subscribe(`board-${message.boardId}`);
-                console.log(`Subscribed to board-${message.boardId}`);
             }
             if (message.type === 'subscribe-project' && message.projectId) {
                 ws.subscribe(`project-${message.projectId}`);
-                console.log(`Subscribed to project-${message.projectId}`);
             }
             if (message.type === 'subscribe-user' && message.userId) {
                 ws.subscribe(`user-${message.userId}`);
-                console.log(`Subscribed to user-${message.userId}`);
             }
             if (message.type === 'unsubscribe' && message.boardId) {
                 ws.unsubscribe(`board-${message.boardId}`);
@@ -109,7 +105,6 @@ app
             }
         },
         close(ws) {
-            console.log('WS Closed');
         }
     })
 
@@ -355,37 +350,24 @@ app
     .derive(async ({ cookie, set, request, path }) => {
         const sessionId = cookie.session_id?.value;
 
-        // Skip debug logging for common non-auth routes if preferred, or just log everything
-        if (!path.startsWith('/uploads') && !path.startsWith('/ws')) {
-            console.log(`\n[DEBUG] ---------------------------`);
-            console.log(`[DEBUG] Incoming Request: ${request.method} ${path}`);
-            console.log(`[DEBUG] Request Origin: ${request.headers.get('origin')}`);
-            console.log(`[DEBUG] Supplied Cookies:`, Object.keys(cookie));
-        }
-
         if (!sessionId || typeof sessionId !== 'string') {
-            if (!path.startsWith('/uploads') && !path.startsWith('/ws')) console.log(`[DEBUG] Auth Failed: No valid session_id cookie provided.`);
             return { user: null };
         }
 
         const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
         if (!session) {
-            console.log(`[DEBUG] Auth Failed: Session ID invalid or missing in DB.`);
             return { user: null };
         }
         
         if (session.expiresAt < new Date()) {
-            console.log(`[DEBUG] Auth Failed: Session has expired.`);
             return { user: null };
         }
 
         const user = await db.select().from(users).where(eq(users.id, session.userId)).get();
         if (user?.isBanned) {
-            console.log(`[DEBUG] Auth Failed: User is banned.`);
             return { user: null };
         }
         
-        if (!path.startsWith('/uploads') && !path.startsWith('/ws')) console.log(`[DEBUG] Auth Success: Authorized as ${user?.email}`);
         return { user };
     })
     .onBeforeHandle(({ path, request, user, set }) => {
@@ -397,7 +379,6 @@ app
             return;
         }
         if (!user) {
-            console.log(`[DEBUG] Returning 401 Unauthorized for protected route: ${path}`);
             set.status = 401;
             return { error: 'Unauthorized' };
         }
@@ -1105,8 +1086,6 @@ app
             const q = query.q?.trim().toLowerCase() || '';
             const dueSoon = query.dueSoon === 'true';
             const searchDate = query.date; // YYYY-MM-DD
-
-            console.log(`[Search] q: "${q}", dueSoon: ${dueSoon}, date: ${searchDate}`);
 
             if (!q && !dueSoon && !searchDate) return [];
 
