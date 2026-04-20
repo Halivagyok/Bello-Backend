@@ -790,12 +790,60 @@ app
                 broadcastProjectUpdate(newBoard.projectId);
             }
 
+            if (body.template && body.template !== 'empty') {
+                const templates: Record<string, { title: string, color?: string }[]> = {
+                    'kanban': [
+                        { title: 'To Do', color: '#ef4444' },
+                        { title: 'In Progress', color: '#eab308' },
+                        { title: 'Done', color: '#22c55e' }
+                    ],
+                    'weekly': [
+                        { title: 'Monday' },
+                        { title: 'Tuesday' },
+                        { title: 'Wednesday' },
+                        { title: 'Thursday' },
+                        { title: 'Friday' },
+                        { title: 'Weekend' }
+                    ],
+                    'project': [
+                        { title: 'Backlog' },
+                        { title: 'Ideas/Research' },
+                        { title: 'In Progress' },
+                        { title: 'Review' },
+                        { title: 'Done', color: '#22c55e' }
+                    ],
+                    'brainstorming': [
+                        { title: 'Wild Ideas' },
+                        { title: 'Needs Details' },
+                        { title: 'Feasible' },
+                        { title: 'Discarded', color: '#ef4444' }
+                    ]
+                };
+
+                const listsToCreate = templates[body.template];
+                if (listsToCreate) {
+                    let pos = 1000;
+                    for (const l of listsToCreate) {
+                        await db.insert(lists).values({
+                            id: crypto.randomUUID(),
+                            title: l.title,
+                            position: pos,
+                            boardId: newBoard.id,
+                            ownerId: user!.id,
+                            color: l.color || null
+                        });
+                        pos += 1000;
+                    }
+                }
+            }
+
             return newBoard;
         }, {
             body: t.Object({
                 title: t.String(),
                 projectId: t.Optional(t.String()),
-                visibility: t.Optional(t.String())
+                visibility: t.Optional(t.String()),
+                template: t.Optional(t.String())
             })
         })
 
