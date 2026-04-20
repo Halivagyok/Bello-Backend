@@ -380,7 +380,9 @@ app
             return;
         }
         const isPublicBoardRequest = path.match(/^\/boards\/[^\/]+$/) && request.method === 'GET';
-        if (isPublicBoardRequest) {
+        const isPublicBoardListRequest = path === '/boards' && request.method === 'GET';
+        const isPublicProjectListRequest = path === '/projects' && request.method === 'GET';
+        if (isPublicBoardRequest || isPublicBoardListRequest || isPublicProjectListRequest) {
             return;
         }
         if (!user) {
@@ -392,6 +394,11 @@ app
     // --- PROJECTS ---
     .group('/projects', (app) => app
         .get('/', async ({ user }) => {
+            if (!user) {
+                const allProjects = await db.select().from(projects);
+                return allProjects.filter(p => p.visibility === 'public');
+            }
+
             // Get projects where user is owner or member
             const memberProjects = await db.select({
                 projectId: projectMembers.projectId
@@ -408,6 +415,7 @@ app
                 id: crypto.randomUUID(),
                 title: body.title,
                 description: body.description,
+                visibility: body.visibility || 'workspace',
                 ownerId: user!.id,
             };
             await db.insert(projects).values(newProject);
@@ -417,7 +425,8 @@ app
         }, {
             body: t.Object({
                 title: t.String(),
-                description: t.Optional(t.String())
+                description: t.Optional(t.String()),
+                visibility: t.Optional(t.String())
             })
         })
 
@@ -569,7 +578,8 @@ app
             body: t.Object({
                 boardIds: t.Optional(t.Array(t.String())),
                 title: t.Optional(t.String()),
-                description: t.Optional(t.String())
+                description: t.Optional(t.String()),
+                visibility: t.Optional(t.String())
             })
         })
 
@@ -719,11 +729,46 @@ app
 
             return { success: true };
         })
+
+        .delete('/:id', async ({ params, user, set }) => {
+            const project = await db.select().from(projects).where(eq(projects.id, params.id)).get();
+            if (!project) { set.status = 404; return { error: 'Project not found' }; }
+
+            if (project.ownerId !== user!.id && !user!.isAdmin) {
+                set.status = 403; return { error: 'Forbidden. Only the owner can delete a project.' };
+            }
+
+            const projectBoards = await db.select().from(boards).where(eq(boards.projectId, params.id));
+            
+            await db.delete(projects).where(eq(projects.id, params.id));
+            
+            for (const board of projectBoards) {
+                broadcastUpdate(board.id);
+            }
+
+            return { success: true };
+        })
     )
 
     // --- BOARDS ---
     .group('/boards', (app) => app
         .get('/', async ({ user }) => {
+            if (!user) {
+                const allBoards = await db.select({
+                    id: boards.id,
+                    title: boards.title,
+                    ownerId: boards.ownerId,
+                    projectId: boards.projectId,
+                    visibility: boards.visibility,
+                    createdAt: boards.createdAt,
+                    ownerAvatarUrl: users.avatarUrl,
+                    ownerName: users.name
+                })
+                    .from(boards)
+                    .innerJoin(users, eq(users.id, boards.ownerId));
+                return allBoards.filter(b => b.visibility === 'public');
+            }
+
             const memberBoards = await db.select({ boardId: boardMembers.boardId }).from(boardMembers).where(eq(boardMembers.userId, user!.id));
             const boardIds = memberBoards.map(m => m.boardId);
 

@@ -44,6 +44,7 @@ export const projects = sqliteTable("projects", {
     description: text("description"),
     boardIds: text("board_ids", { mode: "json" }).$type<string[]>(),
     ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: 'cascade' }),
+    visibility: text("visibility").notNull().default('workspace'), // 'private' | 'workspace' | 'public'
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
 });
 
