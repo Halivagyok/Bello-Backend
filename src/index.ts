@@ -354,20 +354,25 @@ app
     // --- PROTECTED ROUTES ---
     .derive(async ({ set, request }) => {
         const cookieHeader = request.headers.get('cookie') || '';
-        const sessionId = cookieHeader.split('; ')
-            .find(row => row.startsWith('session_id='))
-            ?.split('=')[1];
+        const sessionIds = cookieHeader.split(';')
+            .map(c => c.trim())
+            .filter(row => row.startsWith('session_id='))
+            .map(row => row.split('=')[1]);
 
-        if (!sessionId) {
+        if (sessionIds.length === 0) {
             return { user: null };
         }
 
-        const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+        let session = null;
+        for (const id of sessionIds) {
+            const found = await db.select().from(sessions).where(eq(sessions.id, id)).get();
+            if (found && found.expiresAt > new Date()) {
+                session = found;
+                break;
+            }
+        }
+
         if (!session) {
-            return { user: null };
-        }
-        
-        if (session.expiresAt < new Date()) {
             return { user: null };
         }
 
