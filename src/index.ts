@@ -352,10 +352,13 @@ app
     )
 
     // --- PROTECTED ROUTES ---
-    .derive(async ({ cookie, set, request, path }) => {
-        const sessionId = cookie.session_id?.value;
+    .derive(async ({ set, request }) => {
+        const cookieHeader = request.headers.get('cookie') || '';
+        const sessionId = cookieHeader.split('; ')
+            .find(row => row.startsWith('session_id='))
+            ?.split('=')[1];
 
-        if (!sessionId || typeof sessionId !== 'string') {
+        if (!sessionId) {
             return { user: null };
         }
 
