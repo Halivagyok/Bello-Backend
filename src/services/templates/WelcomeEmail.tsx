@@ -13,9 +13,10 @@ import {
 
 interface WelcomeEmailProps {
   name: string;
+  url: string;
 }
 
-export const WelcomeEmail = ({ name }: WelcomeEmailProps) => {
+export const WelcomeEmail = ({ name, url }: WelcomeEmailProps) => {
   return (
     <Html>
       <Head />
@@ -34,15 +35,12 @@ export const WelcomeEmail = ({ name }: WelcomeEmailProps) => {
             </Text>
             <div className="text-center" style={{ textAlign: "center" }}>
                 <Button 
-                    href="http://localhost:5173/boards"
+                    href={`${url}/boards`}
                     style={button}
                 >
                     Get Started
                 </Button>
             </div>
-            <Text className="text-gray-500 text-sm mt-8 border-t border-gray-200 pt-6 text-center">
-              If you have any questions, simply reply to this email. We're always here to help!
-            </Text>
           </Container>
         </Body>
       </Tailwind>

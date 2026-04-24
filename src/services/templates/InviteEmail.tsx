@@ -16,11 +16,11 @@ interface InviteEmailProps {
   projectName: string;
   role: string;
   projectId: string;
+  url: string;
 }
 
-export const InviteEmail = ({ inviterName, projectName, role, projectId }: InviteEmailProps) => {
-  const frontEndUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-  const inviteLink = `${frontEndUrl}/projects/${projectId}`;
+export const InviteEmail = ({ inviterName, projectName, role, projectId, url }: InviteEmailProps) => {
+  const inviteLink = `${url}/projects/${projectId}`;
 
   return (
     <Html>

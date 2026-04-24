@@ -26,7 +26,8 @@ export const sendWelcomeEmail = async (to: string, name: string) => {
     }
 
     try {
-        const html = await render(React.createElement(WelcomeEmail, { name }));
+        const frontEndUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+        const html = await render(React.createElement(WelcomeEmail, { name, url: frontEndUrl }));
 
         await transporter.sendMail({
             from: defaultFrom,
@@ -71,7 +72,8 @@ export const sendInviteEmail = async (to: string, inviterName: string, projectNa
     }
 
     try {
-        const html = await render(React.createElement(InviteEmail, { inviterName, projectName, role, projectId }));
+        const frontEndUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+        const html = await render(React.createElement(InviteEmail, { inviterName, projectName, role, projectId, url: frontEndUrl }));
 
         await transporter.sendMail({
             from: defaultFrom,
